@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+config.yaml
+*.wav
+*.aiff
+*.mp3
+.codex-voice-orb/
+.DS_Store

@@ -1,0 +1,71 @@
+# codex-voice-orb v0.1
+# 复制为 config.yaml 后再改。密钥不要写进这个文件。
+
+audio:
+  mode: ptt                 # ptt：按住热键说话。vad：靠音量自动分段
+  # input_device: "USB Audio"   # 留空则用系统默认输入。doctor 会列出设备名
+  sample_rate: 16000
+  channels: 1
+  hotkey: "ctrl+space"
+  confirm_key: "ctrl+shift+y"
+  min_utterance_ms: 250
+  gate_during_playback: false   # 保持 false 才能在播放时插话打断
+  vad:
+    threshold: 0.02
+    start_ms: 200
+    end_ms: 700
+
+stt:
+  engine: faster-whisper    # 或 whisper.cpp
+  model: small              # 中英混合。想更准可换成 medium 或 large-v3
+  language: auto            # auto 同时覆盖中文和英文；也可写 zh 或 en
+  device: cpu
+  compute_type: int8
+  # model_path: ~/models/ggml-small.bin
+  whisper_cpp_bin: whisper-cli
+
+tts:
+  engine: say               # v0.1 的默认引擎是 macOS say
+  # voice: Ting-Ting        # 想固定中文音色再打开。机器上要已经装了这个声音
+  rate: 180
+  max_chars: 280
+  max_sentences: 2
+  ack: "好。"
+  output_dir: ~/.codex-voice-orb/tts
+
+playback:
+  player: auto              # macOS 用 afplay
+
+codex:
+  bin: /opt/homebrew/bin/codex
+  sandbox: read-only        # 改代码时再换成 workspace-write。不要写 danger-full-access
+  # model: gpt-5.4
+  config_overrides: []      # 每一项都会变成 codex exec -c KEY=VALUE
+  images: []
+  # cwd: ~/src/your-repo
+  extra_args: []
+  timeout_s: 180
+  resume: id                # id：用上次的 thread id。last：codex exec resume --last
+  skip_git_repo_check: true
+  voice_preamble: "你正在通过语音助手回答。请先用一两句口语给出可以直接朗读的结论，不要使用 Markdown、代码块或链接。需要时再补充短细节。"
+
+permissions:
+  confirm_timeout_s: 10
+  allow_full_auto: false
+  allow_danger_full_access: false
+  confirm_prompt: "这是高风险操作。请说确认，或按确认键。十秒内未确认会取消。"
+  cancel_message: "已取消，没有执行。"
+  timeout_message: "超时未确认，已取消。"
+  unclear_message: "没有听清确认，已取消。"
+  blocked_message: "已拦住高风险操作，没有继续执行。"
+
+session:
+  path: ~/.codex-voice-orb/session.json
+  bind_cwd: true
+
+metrics:
+  path: ~/.codex-voice-orb/metrics.jsonl
+
+paths:
+  audio_dir: ~/.codex-voice-orb/audio
+  delete_audio_after_stt: true
