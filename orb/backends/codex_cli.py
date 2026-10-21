@@ -465,9 +465,8 @@ class CodexCliBackend:
             if text:
                 holder["messages"].append(text)
             return
-        # command_execution, file_change, and mcp_tool_call are emitted after the
-        # action has already started. Recording them can force a later confirmation.
-        # It does not stop the action that produced the event.
+        # These events arrive after the tool has started. Read-only shells are
+        # inspection, not a confirmation. Recording them does not undo them.
         if item_type == "command_execution":
             command = _item_command(item)
             if not command:

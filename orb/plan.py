@@ -1,10 +1,17 @@
-"""Read-only execution plan returned before any mutating Codex turn."""
+"""Read-only execution plan returned before any mutating Codex turn.
+
+Shell commands Codex runs while planning are inspection unless they would
+change the machine. `pwd`, `rg`, and `sed -n` must not become a confirmation
+prompt. A second process still waits for confirmation when the plan asks to
+write, delete, pay, deploy, send, or to run outside the read-only sandbox.
+"""
 
 from __future__ import annotations
 
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -131,28 +138,249 @@ def parse_plan(text: str) -> ExecutionPlan:
     return ExecutionPlan(spoken=spoken.strip(), execute=execute, actions=tuple(actions))
 
 
-def concrete_actions(plan: ExecutionPlan, side_effects: tuple[str, ...] = ()) -> tuple[PlannedAction, ...]:
-    actions = tuple(action for action in plan.actions if action.kind != "answer")
-    if actions:
-        return actions
-    if side_effects:
-        return tuple(
-            PlannedAction(kind="other", summary="规划阶段已出现事件：" + item, risk="high") for item in side_effects
-        )
-    return ()
+_READONLY_BIN = frozenset(
+    {
+        "pwd",
+        "ls",
+        "rg",
+        "grep",
+        "egrep",
+        "fgrep",
+        "ag",
+        "ack",
+        "fd",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "file",
+        "stat",
+        "du",
+        "df",
+        "which",
+        "whence",
+        "whoami",
+        "id",
+        "uname",
+        "date",
+        "echo",
+        "printf",
+        "true",
+        "false",
+        "basename",
+        "dirname",
+        "realpath",
+        "readlink",
+        "cut",
+        "sort",
+        "uniq",
+        "tr",
+        "column",
+        "nl",
+        "od",
+        "hexdump",
+        "diff",
+        "cmp",
+        "comm",
+        "jq",
+        "tree",
+        "less",
+        "more",
+        "bat",
+        "printenv",
+        "dirname",
+    }
+)
+_GIT_READ = frozenset(
+    {"status", "diff", "log", "show", "rev-parse", "ls-files", "describe", "blame", "shortlog", "grep", "version", "help"}
+)
+_SHELLS = frozenset({"zsh", "bash", "sh"})
+_FIND_BAD = frozenset({"-delete", "-exec", "-execdir", "-ok", "-fprint", "-fls"})
+_MUTATING = re.compile(
+    r"(?:^|[;&|`\n(])\s*(?:(?:/\S+/)?(?:"
+    r"rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|install|tee|dd|sudo|mkfs|diskutil|"
+    r"shutdown|reboot|launchctl|osascript|open|curl|wget|ssh|scp|rsync|npm|pip|pip3|brew|"
+    r"python|python3|node|ruby|perl"
+    r")\b|git\s+(?:push|commit|reset|clean|checkout|switch|merge|rebase|stash|add|apply|restore|tag)\b)",
+    re.IGNORECASE,
+)
 
 
-def needs_execute_confirmation(plan: ExecutionPlan, side_effects: tuple[str, ...] = ()) -> bool:
-    """True only when a second, mutating process might be started.
+def unwrap_shell(command: str) -> str:
+    """Return the script inside `zsh -lc '...'` / `bash -c`, up to a few layers."""
+    text = command.strip()
+    for _ in range(3):
+        match = re.match(r"^(?:/\S+/)?(?P<shell>zsh|bash|sh)\b(?P<rest>.*)$", text, re.IGNORECASE)
+        if not match or match.group("shell").lower() not in _SHELLS:
+            break
+        rest = match.group("rest").strip()
+        if not rest.startswith("-"):
+            break
+        flag, _, rest = rest.partition(" ")
+        if "c" not in flag:
+            if rest.startswith("-") and "c" in rest.split(maxsplit=1)[0]:
+                _flag, _, rest = rest.partition(" ")
+            else:
+                break
+        rest = rest.strip()
+        if len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in {"'", '"'}:
+            rest = rest[1:-1]
+        if rest == text:
+            break
+        text = rest.strip()
+    return text
 
-    A high-risk keyword with an empty plan does not count: the keyword screen
-    must not launch the configured write sandbox by itself.
-    """
-    if side_effects:
-        return True
-    if concrete_actions(plan):
+
+def _has_write_redirect(script: str) -> bool:
+    quote = None
+    for index, char in enumerate(script):
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char != ">":
+            continue
+        previous = script[index - 1] if index else ""
+        nxt = script[index + 1] if index + 1 < len(script) else ""
+        if previous.isdigit() and nxt == "&":
+            continue
+        if nxt == "&" and previous != "&":
+            continue
         return True
     return False
+
+
+def _split_segments(script: str) -> list[str] | None:
+    if "$(" in script or "`" in script:
+        return None
+    parts: list[str] = []
+    buf: list[str] = []
+    quote = None
+    index = 0
+    while index < len(script):
+        char = script[index]
+        if quote:
+            buf.append(char)
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            buf.append(char)
+            index += 1
+            continue
+        if script.startswith("&&", index) or script.startswith("||", index):
+            parts.append("".join(buf))
+            buf = []
+            index += 2
+            continue
+        if char in {";", "|", "\n"}:
+            parts.append("".join(buf))
+            buf = []
+            index += 1
+            continue
+        buf.append(char)
+        index += 1
+    parts.append("".join(buf))
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _segment_is_readonly(segment: str) -> bool:
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        return False
+    while tokens and "=" in tokens[0] and not tokens[0].startswith("="):
+        tokens = tokens[1:]
+    while tokens and Path(tokens[0]).name in {"command", "builtin", "time", "nice"}:
+        tokens = tokens[1:]
+    if not tokens:
+        return False
+    name = Path(tokens[0]).name
+    if name == "git":
+        if len(tokens) < 2 or tokens[1] not in _GIT_READ:
+            return False
+        return "--hard" not in tokens
+    if name == "sed":
+        return not any(token == "--in-place" or token.startswith("-i") for token in tokens[1:])
+    if name == "find":
+        return not any(token in _FIND_BAD for token in tokens[1:])
+    if name == "env":
+        return False
+    return name in _READONLY_BIN
+
+
+def command_is_readonly(command: str) -> bool:
+    """True for inspection shells such as pwd, rg, and sed -n. Unknown commands are not reads."""
+    script = unwrap_shell(command)
+    if not script or _has_write_redirect(script) or command_is_mutating(command):
+        return False
+    segments = _split_segments(script)
+    if not segments:
+        return False
+    return all(_segment_is_readonly(segment) for segment in segments)
+
+
+def command_is_mutating(command: str) -> bool:
+    """True for shells that would leave a read-only inspection: rm, redirects, git push, sed -i."""
+    script = unwrap_shell(command)
+    if not script:
+        return False
+    if _has_write_redirect(script):
+        return True
+    if _MUTATING.search(script):
+        return True
+    if re.search(r"(?:^|[\s;&|])sed\b", script, re.IGNORECASE) and re.search(
+        r"(?:^|\s)--in-place\b|(?:^|\s)-i(?:\b|\.)", script
+    ):
+        return True
+    if re.search(r"(?:^|[\s;&|])find\b", script) and re.search(r"-(?:delete|exec|execdir|ok|fprint)\b", script):
+        return True
+    return False
+
+
+def observation_is_unsettled(item: str) -> bool:
+    """A plan-phase event that is not read-only inspection.
+
+    These already happened. They do not by themselves schedule another process,
+    and they must not hide the spoken answer.
+    """
+    if item.startswith("file_change"):
+        return True
+    if command_is_readonly(item):
+        return False
+    return True
+
+
+def action_needs_confirmation(action: PlannedAction, sandbox: str) -> bool:
+    """Whether this planned action may start a process outside pure read-only Q&A."""
+    if action.kind == "answer":
+        return False
+    if action.kind in {"write", "delete", "send", "deploy", "pay"}:
+        return True
+    if command_is_mutating(action.summary) or _KEY_ONLY_TEXT.search(action.summary):
+        return True
+    if sandbox != "read-only":
+        return True
+    return False
+
+
+def actions_requiring_confirmation(plan: ExecutionPlan, sandbox: str) -> tuple[PlannedAction, ...]:
+    return tuple(action for action in plan.actions if action_needs_confirmation(action, sandbox))
+
+
+def needs_execute_confirmation(plan: ExecutionPlan, sandbox: str) -> bool:
+    """True when a separate execute process should wait for the user.
+
+    Read-only `command_execution` events are not actions. A keyword in the
+    user's sentence is not an action either. Only the plan's own mutating
+    actions, or any non-answer action that would run in a wider sandbox, count.
+    """
+    return bool(actions_requiring_confirmation(plan, sandbox))
 
 
 def is_key_only(actions: tuple[PlannedAction, ...], user_text: str, sandbox: str) -> bool:
@@ -171,9 +399,10 @@ def confirmation_text(
     key_only: bool,
 ) -> str:
     lines: list[str] = []
-    if side_effects:
-        lines.append("规划阶段已经出现这些事件。日志晚于动作本身，取消不能撤销：")
-        lines.extend(side_effects)
+    unsettled = [item for item in side_effects if observation_is_unsettled(item)]
+    if unsettled:
+        lines.append("规划阶段已经出现这些非只读事件。它们已经发生，确认与否都不能撤销：")
+        lines.extend(unsettled)
     if actions:
         lines.append("确认后才会另起一个执行进程。动作是：")
         for action in actions:

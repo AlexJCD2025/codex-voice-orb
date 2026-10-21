@@ -26,10 +26,10 @@ from orb.permissions import classify_confirmation
 from orb.plan import (
     PlannedAction,
     PlanResult,
-    concrete_actions,
+    actions_requiring_confirmation,
     confirmation_text,
     is_key_only,
-    needs_execute_confirmation,
+    observation_is_unsettled,
 )
 from orb.stt import is_usable_transcript
 from orb.summary import spoken_summary
@@ -305,8 +305,15 @@ class Orchestrator:
         if self._cancel.is_set():
             self._finish(turn, "interrupted")
             return self._result(turn, "interrupted", reply=planned.text, session_id=planned.session_id)
-        actions = concrete_actions(planned.plan, planned.side_effects)
-        if not needs_execute_confirmation(planned.plan, planned.side_effects):
+        sandbox = self.config.codex.sandbox
+        actions = actions_requiring_confirmation(planned.plan, sandbox)
+        if not actions:
+            unsettled = [item for item in planned.side_effects if observation_is_unsettled(item)]
+            if unsettled:
+                log.warning(
+                    "read-only plan saw non-inspection events; speaking the answer and not starting execute: %s",
+                    unsettled,
+                )
             return self._speak_answer(turn, planned.text, planned.session_id)
         turn.actions = actions
         turn.risk = "high"

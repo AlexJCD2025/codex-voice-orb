@@ -98,6 +98,28 @@ def main() -> int:
             ensure_ascii=False,
         )
     elif "规划阶段" in prompt:
+        events.append(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-read-1",
+                    "type": "command_execution",
+                    "command": "/bin/zsh -lc \"pwd && rg --files -g 'README*' | head -30\"",
+                    "status": "completed",
+                },
+            }
+        )
+        events.append(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-read-2",
+                    "type": "command_execution",
+                    "command": "/bin/zsh -lc \"sed -n '1,180p' README.md && sed -n '1,160p' pyproject.toml\"",
+                    "status": "completed",
+                },
+            }
+        )
         message = json.dumps(
             {"spoken": "这是口语结论。已经处理完。", "execute": False, "actions": []},
             ensure_ascii=False,

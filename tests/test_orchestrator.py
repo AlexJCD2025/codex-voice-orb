@@ -28,6 +28,7 @@ class FakeBackend:
         self.text = text
         self.error = None
         self.side_effects: tuple[str, ...] = ()
+        self.forced_plan = None
         self.always = False
 
     def always_requires_confirmation(self):
@@ -41,6 +42,8 @@ class FakeBackend:
             raise CodexCancelled("cancelled")
         if self.error:
             raise self.error
+        if self.forced_plan is not None:
+            return self.forced_plan
         if classify_risk(prompt) == "high":
             kind = "command"
             if any(word in prompt for word in ("删", "delete", "rm ")):
@@ -133,10 +136,11 @@ class FakeSTT:
         return self.text
 
 
-def _orch(tmp_path, backend, tts=None, playback=None, stt=None, clock=None, ack="好。"):
+def _orch(tmp_path, backend, tts=None, playback=None, stt=None, clock=None, ack="好。", sandbox="read-only"):
     config = AppConfig()
     config = replace(
         config,
+        codex=replace(config.codex, sandbox=sandbox),
         tts=replace(config.tts, ack=ack, output_dir=str(tmp_path / "tts")),
         metrics=replace(config.metrics, path=str(tmp_path / "metrics.jsonl")),
         paths=replace(config.paths, audio_dir=str(tmp_path / "audio"), delete_audio_after_stt=True),
@@ -238,17 +242,84 @@ def test_confirm_key_and_voice_yes_for_a_command(tmp_path):
     assert backend.calls[-1]["phase"] == "execute"
 
 
-def test_plan_side_effect_asks_before_a_second_process(tmp_path):
-    backend = FakeBackend()
-    backend.side_effects = ("rm -rf /tmp/x",)
+READ_PWD = "/bin/zsh -lc \"pwd && rg --files -g 'README*' | head -30\""
+READ_SED = "/bin/zsh -lc \"sed -n '1,180p' README.md && sed -n '1,160p' pyproject.toml\""
+
+
+def test_readonly_plan_commands_finish_without_confirmation(tmp_path):
+    from orb.plan import command_is_mutating, command_is_readonly
+
+    assert command_is_readonly(READ_PWD)
+    assert command_is_readonly(READ_SED)
+    assert not command_is_mutating(READ_PWD)
+    assert not command_is_readonly("/bin/zsh -lc 'rm -rf /tmp/secret'")
+    assert command_is_mutating("/bin/zsh -lc 'rm -rf /tmp/secret'")
+    backend = FakeBackend(text="这个目录是语音助手。它把麦接到 Codex。")
+    backend.side_effects = (READ_PWD, READ_SED)
     tts = FakeTTS()
     _config, orchestrator = _orch(tmp_path, backend, tts=tts)
-    result = orchestrator.submit_text("列一下文件")
-    assert result.status == "awaiting_confirmation"
+    result = orchestrator.submit_text("用两句话说明当前目录是做什么的")
+    assert result.status == "ok"
+    assert "语音助手" in result.summary
     assert [call["phase"] for call in backend.calls] == ["plan"]
-    assert "rm -rf /tmp/x" in tts.texts[-1]
+    assert "确认键" not in "\n".join(tts.texts)
+
+
+def test_already_ran_rm_does_not_hide_the_answer(tmp_path):
+    backend = FakeBackend()
+    backend.side_effects = ("/bin/zsh -lc 'rm -rf /tmp/x'",)
+    _config, orchestrator = _orch(tmp_path, backend)
+    result = orchestrator.submit_text("列一下文件")
+    assert result.status == "ok"
+    assert [call["phase"] for call in backend.calls] == ["plan"]
+
+
+def test_write_plan_still_confirms_and_delete_stays_key_only(tmp_path):
+    backend = FakeBackend()
+    backend.forced_plan = PlanResult(
+        plan=ExecutionPlan(
+            spoken="将写入备注。",
+            execute=True,
+            actions=(PlannedAction("write", "写入备注", "low"),),
+        ),
+        side_effects=(READ_PWD,),
+    )
+    _config, orchestrator = _orch(tmp_path, backend)
+    pending = orchestrator.submit_text("写入备注")
+    assert pending.status == "awaiting_confirmation"
+    assert [call["phase"] for call in backend.calls] == ["plan"]
+    confirmed = orchestrator.submit_text("确认")
+    assert confirmed.status == "ok"
+    assert backend.calls[-1]["phase"] == "execute"
+
+    backend.calls.clear()
+    backend.forced_plan = PlanResult(
+        plan=ExecutionPlan(
+            spoken="将删除临时文件。",
+            execute=True,
+            actions=(PlannedAction("delete", "删除临时文件", "high"),),
+        ),
+        side_effects=("/bin/zsh -lc 'rm -rf /tmp/secret'",),
+    )
+    assert orchestrator.submit_text("把临时文件删掉").status == "awaiting_confirmation"
     assert orchestrator.submit_text("确认").status == "awaiting_confirmation"
-    assert len(backend.calls) == 1
+    assert [call["phase"] for call in backend.calls] == ["plan"]
+    assert orchestrator.confirm_with_key().status == "ok"
+    assert backend.calls[-1]["phase"] == "execute"
+
+
+def test_wider_sandbox_confirms_before_a_second_process(tmp_path):
+    backend = FakeBackend()
+    backend.forced_plan = PlanResult(
+        plan=ExecutionPlan(
+            spoken="看完了。",
+            execute=True,
+            actions=(PlannedAction("command", READ_PWD, "low"),),
+        ),
+    )
+    _config, orchestrator = _orch(tmp_path, backend, sandbox="workspace-write")
+    assert orchestrator.submit_text("现在几点").status == "awaiting_confirmation"
+    assert [call["phase"] for call in backend.calls] == ["plan"]
 
 
 def test_barge_in_during_ack_skips_codex(tmp_path):
