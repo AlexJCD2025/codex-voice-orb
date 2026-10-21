@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import logging
 import queue
+import select
 import sys
+import time
 
 from orb import __version__
 from orb.audio import AudioDependencyError, AudioInput
@@ -27,7 +29,7 @@ def _common_parser() -> argparse.ArgumentParser:
         "--config",
         "-c",
         default=argparse.SUPPRESS,
-        help="config.yaml 路径。缺省时读取 ./config.yaml 或 ~/.codex-voice-orb/config.yaml",
+        help="config.yaml 路径。缺省时只读 ~/.codex-voice-orb/config.yaml，不读取当前目录",
     )
     common.add_argument("--verbose", "-v", action="store_true", default=argparse.SUPPRESS, help="打印调试日志")
     return common
@@ -42,7 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"codex-voice-orb {__version__}")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("doctor", parents=[_common_parser()], help="检查麦克风、Codex、登录状态、语音识别模型和 TTS")
+    doctor = sub.add_parser("doctor", parents=[_common_parser()], help="检查麦克风、Codex、登录状态、语音识别模型和 TTS")
+    doctor.add_argument("--hotkey", action="store_true", help="等待 5 秒，看系统有没有把一次按键交给本程序")
 
     once = sub.add_parser("once", parents=[_common_parser()], help="把一段文字交给 Codex，并朗读摘要")
     once.add_argument("--text", "-t", required=True, help="要发送的文字")
@@ -76,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
     if args.command == "doctor":
-        checks = run_doctor(config)
+        checks = run_doctor(config, hotkey=getattr(args, "hotkey", False))
         sys.stdout.write(render_report(checks))
         return doctor_exit_code(checks)
     if args.command == "session":
@@ -112,19 +115,63 @@ def build_runtime(config: AppConfig, *, speak: bool = True, backend=None, stt=No
 
 def _once(runtime, text: str, images: list[str]) -> int:
     result = runtime.orchestrator.submit_text(text, images=images)
-    if result.status == "awaiting_confirmation":
-        print("请输入确认（确认 / 取消）：", flush=True)
-        try:
-            answer = input()
-        except EOFError:
-            answer = ""
+    if result.status != "awaiting_confirmation":
+        return 0 if result.status == "ok" else 1
+    print("请输入确认或取消。删除、付款、部署、发送只能按确认键，输入“确认”不会执行。", flush=True)
+    timeout = runtime.config.permissions.confirm_timeout_s
+    deadline = time.monotonic() + timeout
+    while result.status == "awaiting_confirmation" and time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        answer = _read_stdin(remaining)
+        if answer is None or answer == "":
+            break
         result = runtime.orchestrator.submit_text(answer)
+    if result.status == "awaiting_confirmation":
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        polled = runtime.orchestrator.poll()
+        if polled is not None:
+            result = polled
     return 0 if result.status == "ok" else 1
 
 
+def _read_stdin(timeout: float) -> str | None:
+    """Wait up to timeout seconds. StringIO has no fileno, so fall back to readline."""
+    if timeout < 0:
+        timeout = 0
+    try:
+        readable, _, _ = select.select([sys.stdin], [], [], timeout)
+    except (TypeError, ValueError, OSError):
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            return ""
+        if line == "":
+            return ""
+        return line.rstrip("\n")
+    if not readable:
+        return None
+    line = sys.stdin.readline()
+    if line == "":
+        return ""
+    return line.rstrip("\n")
+
+
 def _listen_stdin(runtime) -> int:
-    print("输入文字后回车。空行退出。高风险操作会再问一次确认。", flush=True)
+    print("输入文字后回车。空行退出。需要执行时会先做只读规划，再等确认。", flush=True)
     while True:
+        remaining = runtime.orchestrator.confirmation_remaining()
+        if remaining is not None:
+            line = _read_stdin(max(0.0, remaining))
+            if line is None:
+                runtime.orchestrator.poll()
+                continue
+            if line == "":
+                return 0
+            runtime.orchestrator.submit_text(line)
+            runtime.orchestrator.poll()
+            continue
         try:
             line = input("> ")
         except (EOFError, KeyboardInterrupt):
@@ -146,6 +193,7 @@ def _listen_audio(runtime) -> int:
         events.put(event)
 
     audio = AudioInput(config, on_event)
+    runtime.orchestrator.set_gated = audio.set_gated
     try:
         audio.start()
     except AudioDependencyError as exc:
@@ -180,7 +228,10 @@ def _listen_audio(runtime) -> int:
         audio.stop()
         return 1
     if config.audio.mode == "ptt":
-        print(f"正在听。按住 {config.audio.hotkey} 说话，松开后发送。确认键是 {config.audio.confirm_key}。Ctrl+C 退出。", flush=True)
+        print(
+            f"正在听。按住 {config.audio.hotkey} 说话，松开后发送。确认键是 {config.audio.confirm_key}。Ctrl+C 退出。",
+            flush=True,
+        )
     else:
         print("正在听（VAD）。说完停顿后会发送。Ctrl+C 退出。", flush=True)
     try:

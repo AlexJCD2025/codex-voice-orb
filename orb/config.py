@@ -33,9 +33,10 @@ class AudioConfig:
     input_device: str | int | None = None
     sample_rate: int = 16000
     channels: int = 1
-    hotkey: str = "ctrl+space"
+    hotkey: str = "ctrl+alt+space"
     confirm_key: str = "ctrl+shift+y"
     min_utterance_ms: int = 250
+    max_utterance_s: float = 30.0
     gate_during_playback: bool = False
     vad: VadConfig = field(default_factory=VadConfig)
 
@@ -60,6 +61,7 @@ class TtsConfig:
     max_sentences: int = 2
     ack: str = "好。"
     output_dir: str = "~/.codex-voice-orb/tts"
+    delete_after_playback: bool = True
 
 
 @dataclass(frozen=True)
@@ -94,7 +96,7 @@ class PermissionsConfig:
     cancel_message: str = "已取消，没有执行。"
     timeout_message: str = "超时未确认，已取消。"
     unclear_message: str = "没有听清确认，已取消。"
-    blocked_message: str = "已拦住高风险操作，没有继续执行。"
+    blocked_message: str = "没有进入执行。"
 
 
 @dataclass(frozen=True)
@@ -142,11 +144,9 @@ _TOP_KEYS = {
 
 
 def default_config_path() -> Path | None:
-    cwd_file = Path.cwd() / "config.yaml"
-    if cwd_file.exists():
-        return cwd_file
+    """Only the home config is implicit. A cwd config.yaml is not trusted."""
     home_file = Path.home() / ".codex-voice-orb" / "config.yaml"
-    if home_file.exists():
+    if home_file.is_file():
         return home_file
     return None
 
@@ -301,6 +301,7 @@ def _audio(raw: dict[str, Any]) -> AudioConfig:
             "hotkey",
             "confirm_key",
             "min_utterance_ms",
+            "max_utterance_s",
             "gate_during_playback",
             "vad",
         },
@@ -326,9 +327,10 @@ def _audio(raw: dict[str, Any]) -> AudioConfig:
         input_device=device,
         sample_rate=_int(raw, "sample_rate", 16000),
         channels=_int(raw, "channels", 1),
-        hotkey=_str(raw, "hotkey", "ctrl+space"),
+        hotkey=_str(raw, "hotkey", "ctrl+alt+space"),
         confirm_key=_str(raw, "confirm_key", "ctrl+shift+y"),
         min_utterance_ms=_int(raw, "min_utterance_ms", 250),
+        max_utterance_s=_float(raw, "max_utterance_s", 30.0),
         gate_during_playback=_bool(raw, "gate_during_playback", False),
         vad=VadConfig(
             threshold=_float(vad_raw, "threshold", 0.02),
@@ -356,7 +358,11 @@ def _stt(raw: dict[str, Any]) -> SttConfig:
 
 
 def _tts(raw: dict[str, Any]) -> TtsConfig:
-    _unknown(raw, {"engine", "voice", "rate", "max_chars", "max_sentences", "ack", "output_dir"}, "tts")
+    _unknown(
+        raw,
+        {"engine", "voice", "rate", "max_chars", "max_sentences", "ack", "output_dir", "delete_after_playback"},
+        "tts",
+    )
     output = _str(raw, "output_dir", "~/.codex-voice-orb/tts")
     return TtsConfig(
         engine=_str(raw, "engine", "say"),
@@ -366,6 +372,7 @@ def _tts(raw: dict[str, Any]) -> TtsConfig:
         max_sentences=_int(raw, "max_sentences", 2),
         ack=_str(raw, "ack", "好。"),
         output_dir=str(Path(output).expanduser()),
+        delete_after_playback=_bool(raw, "delete_after_playback", True),
     )
 
 
@@ -392,6 +399,12 @@ def _codex(raw: dict[str, Any]) -> CodexConfig:
         },
         "codex",
     )
+    extra_args = _strings(raw, "extra_args")
+    if extra_args:
+        raise ConfigError("codex.extra_args is not allowed; the Codex argv is closed")
+    resume = _str(raw, "resume", "id")
+    if resume == "last":
+        raise ConfigError("codex.resume last is not allowed; resume uses the saved thread id and never passes --last")
     return CodexConfig(
         bin=_str(raw, "bin", "codex"),
         sandbox=_str(raw, "sandbox", "read-only"),
@@ -399,9 +412,9 @@ def _codex(raw: dict[str, Any]) -> CodexConfig:
         config_overrides=_strings(raw, "config_overrides"),
         images=_strings(raw, "images"),
         cwd=_expand(_opt_str(raw, "cwd")),
-        extra_args=_strings(raw, "extra_args"),
+        extra_args=(),
         timeout_s=_float(raw, "timeout_s", 180.0),
-        resume=_choice(_str(raw, "resume", "id"), {"id", "last"}, "codex.resume"),
+        resume=_choice(resume, {"id"}, "codex.resume"),
         voice_preamble=_str(raw, "voice_preamble", CodexConfig.voice_preamble),
         skip_git_repo_check=_bool(raw, "skip_git_repo_check", True),
     )
@@ -465,6 +478,8 @@ def _validate(config: AppConfig) -> None:
         raise ConfigError("audio.vad.threshold must be >= 0")
     if config.audio.vad.start_ms < 0 or config.audio.vad.end_ms < 0:
         raise ConfigError("VAD windows must be >= 0")
+    if config.audio.max_utterance_s <= 0:
+        raise ConfigError("audio.max_utterance_s must be positive")
     if config.codex.timeout_s <= 0:
         raise ConfigError("codex.timeout_s must be positive")
     if config.permissions.confirm_timeout_s <= 0:

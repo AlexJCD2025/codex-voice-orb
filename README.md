@@ -6,24 +6,27 @@
 
 ## 一轮对话
 
-1. 按住热键说话（默认 `Ctrl+Space`），或让 VAD 在你停顿后收尾。
+1. 按住热键说话（默认 `Ctrl+Alt+Space`，避开中文输入法的 Ctrl+Space），或让 VAD 在你停顿后收尾。单段最长默认 30 秒。
 2. 本机 faster-whisper（或 whisper.cpp）转成中文或英文。
-3. 若这句话像删除、部署、付款、发消息、合并、推送这类高风险操作，先等你说「确认」或按确认键。十秒内不确认就取消。
-4. 通过 `orb/backends/codex_cli.py` 调用 `codex exec`。下一轮用保存的 thread id 走 `codex exec resume <id>`。
-5. macOS `say` 合成摘要，`afplay` 播放。你再次开口或按下热键时，播放立刻停。
+3. 先跑一轮只读规划：`codex exec -s read-only`。这一轮不使用你配置的写入沙箱。
+4. 规划结果如果不需要改动，直接朗读。如果规划列出了要执行的动作，或规划过程里已经出现命令、改文件、MCP 调用，就停下来等确认。确认之后才另起一个进程，用你配置的沙箱执行。
+5. 删除、付款、部署、发送，以及 `danger-full-access`，只能按确认键。说「确认」不算。其他动作可以说「确认」或按 `Ctrl+Shift+Y`。十秒内不确认就取消，过期的「确认」不会再开一轮。
+6. 下一轮用保存的 thread id 走 `codex exec resume <id>`。只在这一轮成功结束（`turn.completed`）后才保存。不会使用 `resume --last`。
+7. macOS `say` 合成摘要，`afplay` 播放。你再次开口或按下热键时，播放立刻停。
 
-默认沙箱是 `read-only`。需要改仓库里的文件时，把配置改成 `workspace-write`。这两种是 v0.1 的默认沙箱。程序不会自己加上 `--full-auto`、`--yolo` 或 `danger-full-access`。
+默认执行沙箱是 `read-only`。需要改仓库里的文件时，把配置改成 `workspace-write`。规划轮仍然是 `read-only`。`--yolo`、`--dangerously-bypass-approvals-and-sandbox` 一律拒绝。`--full-auto` 不是 Codex CLI 0.153.4 的参数，出现在参数里也会被拒绝。
 
 ```mermaid
 flowchart LR
   Mic[无线领夹麦 USB 接收器] --> Audio[音频与 VAD]
   Key[按住说话 / 确认键] --> Audio
   Audio --> STT[本地 STT]
-  STT --> Gate{高风险?}
-  Gate -->|是| Confirm[语音或按键确认]
-  Gate -->|否| Codex
-  Confirm --> Codex[codex exec / resume]
-  Codex --> TTS[say 摘要]
+  STT --> Plan[codex exec 只读规划]
+  Plan --> Need{要执行动作?}
+  Need -->|否| TTS
+  Need -->|是| Confirm[确认具体动作]
+  Confirm --> Exec[另一个 codex exec 进程]
+  Exec --> TTS[say 摘要]
   TTS --> Play[播放，可打断]
 ```
 
@@ -57,17 +60,20 @@ cd codex-voice-orb
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[audio,stt,hotkey]"
-cp config.example.yaml config.yaml
+mkdir -p ~/.codex-voice-orb
+cp config.example.yaml ~/.codex-voice-orb/config.yaml
 ```
 
-`config.yaml` 里的 `codex.bin` 保持 `/opt/homebrew/bin/codex`。若 `which codex` 在别的位置，改成那个路径。
+程序只自动读取 `~/.codex-voice-orb/config.yaml`。当前目录里的 `config.yaml` 不会生效，避免一份偶然放在仓库里的配置被当成信任配置。要指定别的文件，用 `orb --config /path/to/config.yaml`。
+
+`codex.bin` 保持 `/opt/homebrew/bin/codex`。若 `which codex` 在别的位置，改成那个路径。`orb doctor` 会打印它实际解析到的绝对路径；文件名不是 `codex` 时只警告，不把任意可执行文件当成失败。
 
 第一次转写会下载 faster-whisper 的 `small` 模型，能同时处理中文和英文。想更准，把 `stt.model` 改成 `medium` 或 `large-v3`。也可以改用 whisper.cpp：安装 `whisper-cli`，把 ggml 模型路径写到 `stt.model_path`，再把 `stt.engine` 设为 `whisper.cpp`。
 
 ### 系统权限
 
 - 系统设置 → 隐私与安全性 → 麦克风：打开「终端」（或 iTerm，看你从哪个 App 启动）。
-- 全局热键还要在同一页打开「输入监视」。pynput 读不到按键时，先看这一项。
+- 全局热键还要在同一页打开「输入监视」和「辅助功能」。终端开了 Secure Keyboard Entry 时，热键也会读不到。`orb doctor` 里的 hotkey 一项只是提醒：监听器能启动，不等于系统已经把按键交过来。要真的试一次按键，再跑 `orb doctor --hotkey`（它会等 5 秒）。
 - 插上 USB 接收器。`orb doctor` 会打印输入设备名。若不用系统默认麦克风，把名字写进 `audio.input_device`。
 
 ## 配置
@@ -75,15 +81,16 @@ cp config.example.yaml config.yaml
 `config.example.yaml` 里每项都有注释。常用的只有这些：
 
 - `audio.mode`：`ptt` 或 `vad`
-- `audio.hotkey` / `audio.confirm_key`：按住说话，以及高风险确认键
-- `codex.sandbox`：`read-only` 或 `workspace-write`
+- `audio.hotkey` / `audio.confirm_key`：按住说话，以及执行确认键。默认热键是 `ctrl+alt+space`
+- `audio.max_utterance_s`：单段最长秒数，默认 30
+- `codex.sandbox`：确认后的执行沙箱，`read-only` 或 `workspace-write`。规划轮固定是 `read-only`
 - `codex.model`：传给 `codex exec -m`
-- `codex.config_overrides`：每一项变成一次 `-c KEY=VALUE`
-- `codex.images` 或命令行 `--image`：传给 `--image`
-- `codex.resume`：`id` 用上次的 thread id；`last` 则调用 `codex exec resume --last`
+- `codex.config_overrides`：只接受 `model`、`model_reasoning_effort`，以及 `sandbox_workspace_write.network_access=false`
+- `codex.images` 或命令行 `--image`：传给 `--image`。执行轮如果续上了规划的 thread id，就不再重复传图片
+- `codex.resume`：只能是 `id`。用上次成功保存的 thread id，不会调用 `resume --last`
 - `tts.voice`：例如 `Ting-Ting`。不填就用系统默认声音
 
-`permissions.allow_full_auto` 和 `allow_danger_full_access` 默认都是 `false`。打开之后，每一轮仍然要先语音或按键确认，程序才会把对应的危险参数传给 Codex。
+没有 `extra_args`。命令行是闭合的，不能从配置里再塞 `--add-dir`、`--sandbox` 或 `--config`。`permissions.allow_full_auto: true` 会让配置加载失败。`allow_danger_full_access` 默认是 `false`；只有显式打开，并且用户按了确认键，执行轮才能使用 `danger-full-access`。规划轮仍然是只读。
 
 ## 第一次真机测试
 
@@ -104,7 +111,7 @@ cp config.example.yaml config.yaml
    orb once --text "用两句话说明当前目录是做什么的"
    ```
 
-   终端会打出完整回复，扬声器或耳机会读一句摘要。这一步失败时，先看 `codex login status`，以及 `config.yaml` 里的 `codex.bin`。
+   终端会打出完整回复，扬声器或耳机会读一句摘要。这一步会先跑只读规划。失败时先看 `codex login status`，以及 doctor 打印的 `codex.bin` 绝对路径。
 
 3. 测多轮是不是同一条 Codex 会话：
 
@@ -119,7 +126,7 @@ cp config.example.yaml config.yaml
    orb session clear
    ```
 
-4. 测麦。按住 `Ctrl+Space`，说「这个目录里有哪些文件」，松开。听到「好。」之后等待，然后听到一句摘要。终端里同时有全文。
+4. 测麦。按住 `Ctrl+Alt+Space`，说「这个目录里有哪些文件」，松开。听到「好。」之后等待，然后听到一句摘要。终端里同时有全文。
 
    ```bash
    orb listen
@@ -133,7 +140,7 @@ cp config.example.yaml config.yaml
    orb once --text "把临时文件删掉"
    ```
 
-   它应先要求确认，并且在你说「确认」或按 `Ctrl+Shift+Y` 之前不调用 Codex。说「取消」，或干等十秒，这一轮就结束。确认之后，Codex 仍跑在 `read-only` 或你配置的 `workspace-write` 里，不会变成 full-auto。
+   它会先做一轮只读规划，然后列出要执行的动作。删除只能按 `Ctrl+Shift+Y`，嘴上说「确认」不会启动执行进程。说「取消」，或干等十秒，执行进程不会出现。确认之后，执行进程用的是 `read-only` 或你配置的 `workspace-write`，不会变成 yolo。
 
 7. 看延迟。每一轮追加一行 JSON，里面是各段毫秒数，没有原文：
 
@@ -143,7 +150,7 @@ cp config.example.yaml config.yaml
 
    字段包括 `stt_ms`、`permission_ms`、`codex_ms`、`tts_ms`、`playback_ms`、`total_ms`。
 
-要改仓库里的文件时，把 `codex.sandbox` 改成 `workspace-write`，再从第 2 步做一次。删除、推送、发消息这类话仍然要先确认。
+要改仓库里的文件时，把 `codex.sandbox` 改成 `workspace-write`，再从第 2 步做一次。规划轮仍是只读。删除、付款、部署、发消息要按确认键之后，才会有第二个进程。
 
 ## 命令
 
@@ -156,19 +163,29 @@ cp config.example.yaml config.yaml
 | `orb listen --stdin` | 用键盘打字，验证 resume |
 | `orb session show` / `orb session clear` | 查看或忘掉 thread id |
 
-配置文件可以用 `orb --config /path/to/config.yaml doctor` 指定。
+配置文件可以用 `orb --config /path/to/config.yaml doctor` 指定。不带 `--config` 时不会读取 `./config.yaml`。
 
 ## 安全边界
 
-- 音频文件默认在转写后删除。指标日志只记耗时和字符数。
-- 发给 Codex 的是文字。`voice_preamble` 会请它先给一句能直接朗读的结论。
-- 高风险词是粗筛，覆盖中英常见的删除、部署、购买、付款、发消息、合并、推送。没命中的危险命令，如果出现在 Codex 的 `command_execution`、删除文件或发送类 MCP 工具事件里，且这一轮没有确认过，进程会被停掉。这是辅助，真正卡住写盘和网络的是 Codex 沙箱。
-- 打断只能停掉本机播放和还在跑的 `codex exec` 子进程。已经在沙箱里执行完的命令不会自动撤销。
-- 回复里的文字只会被朗读，不会被当成新的 shell 指令。
+闸门是「只读规划 → 你确认具体动作 → 另一个执行进程」。执行进程在确认之前不会被创建。关键词本身不会把沙箱切到 `workspace-write`。
+
+这几件事不是闸门：
+
+- Codex 的 JSONL。`command_execution`、`file_change`、`mcp_tool_call` 都是动作已经开始之后才写出来的。看到它们再去杀进程，命令已经跑过了。程序只把这些事件记下来，用来要求你确认后才允许第二个进程。它撤销不了已经发生的事。
+- 规划轮的只读沙箱能挡住工作区写入，挡不住你自己配在 Codex 里的 MCP。0.153.4 没有一个可以单独关掉 MCP、又保留模型和登录的开关。规划提示会要求模型不要调用有副作用的工具，但这不是强制的。
+- `--yolo` 和 `--dangerously-bypass-approvals-and-sandbox` 不会因为确认就放行。`allow_full_auto: true` 不能用来打开它们。
+
+其它边界：
+
+- 音频、whisper.cpp 的文本和 `say` 的 AIFF 用 `0600`，目录用 `0700`，用完就删。删不掉会打出警告。
+- 指标日志只记耗时和字符数，不记原文。
+- 发给 Codex 的是文字。语音不会被拼进 shell。
+- 打断会先 SIGTERM 进程组，宽限之后 SIGKILL，并关掉管道，避免读 stdout 的线程一直挂着。已经执行完的命令不会自动撤销。
+- 确认有期限和轮次。超时之后的「确认」不会新开一轮。含糊的「好」「嗯」「可以」不算确认。等待确认时麦克风是关上的，避免把提示音又听成同意。
 
 ## 开发
 
-后端接口在 `orb/backends/base.py`。再接一个智能体时，实现 `ask()` 并在 `build_runtime()` 里换上即可。TTS 同样只要求 `synthesize(text, turn_id) -> 音频路径`。
+后端接口在 `orb/backends/base.py`。再接一个智能体时，实现 `plan()` 和 `execute()`，并在 `build_runtime()` 里换上。`execute()` 只能由编排器在确认之后调用。TTS 同样只要求 `synthesize(text, turn_id) -> 音频路径`。
 
 单元测试用假的 Codex 进程，不连网，在 Ubuntu 上就能跑：
 
@@ -178,7 +195,7 @@ python -m pytest -q
 python -m orb doctor
 ```
 
-GitHub Actions 在 `ubuntu-latest` 上跑 pytest，并确认 `doctor` 能打印 microphone、codex、stt、tts 四项。这台 Linux 机器上麦、`say` 和 Codex 不存在，`doctor` 会报告失败项，但命令本身要能跑完。
+GitHub Actions 在 `ubuntu-latest` 上跑 pytest，并确认 `doctor` 的 microphone、codex、stt、tts 四行检查都有结果。`macos-latest` 上再跑一遍 pytest，不要求麦克风。这台 Linux 机器上麦、`say` 和 Codex 不存在，`doctor` 会报告失败项，但命令本身要能跑完。
 
 ## 布局
 

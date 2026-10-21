@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 import wave
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from orb.config import AppConfig
+from orb.session import ensure_private_dir
 
 log = logging.getLogger("orb.audio")
 
@@ -64,13 +66,38 @@ def _floats_to_pcm16_pure(frames: object) -> bytes:
     return bytes(out)
 
 
+def resample_pcm16(pcm: bytes, source_rate: int, target_rate: int) -> bytes:
+    if source_rate <= 0 or target_rate <= 0:
+        raise ValueError("sample rate must be positive")
+    count = len(pcm) // 2
+    if count == 0 or source_rate == target_rate:
+        return pcm[: count * 2]
+    samples = [int.from_bytes(pcm[index * 2 : index * 2 + 2], "little", signed=True) for index in range(count)]
+    out_count = max(1, int(round(count * target_rate / source_rate)))
+    out = bytearray()
+    last = count - 1
+    for index in range(out_count):
+        if out_count == 1:
+            position = 0.0
+        else:
+            position = index * last / (out_count - 1)
+        left = int(position)
+        right = min(left + 1, last)
+        frac = position - left
+        value = samples[left] * (1 - frac) + samples[right] * frac
+        bounded = max(-32768, min(32767, int(round(value))))
+        out += int(bounded).to_bytes(2, "little", signed=True)
+    return bytes(out)
+
+
 def write_wav(path: Path, pcm: bytes, sample_rate: int) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     with wave.open(str(path), "wb") as handle:
         handle.setnchannels(1)
         handle.setsampwidth(2)
         handle.setframerate(sample_rate)
         handle.writeframes(pcm)
+    os.chmod(path, 0o600)
     return str(path)
 
 
@@ -89,7 +116,7 @@ class RMSVAD:
         self._preroll = bytearray()
         self._preroll_max = int(sample_rate * 0.3) * 2
 
-    def feed(self, pcm: bytes) -> list[str]:
+    def feed(self, pcm: bytes, max_bytes: int | None = None) -> list[str]:
         count = len(pcm) // 2
         if count == 0:
             return []
@@ -112,6 +139,11 @@ class RMSVAD:
                 events.append("start")
             return events
         self._audio.extend(pcm)
+        if max_bytes is not None and len(self._audio) >= max_bytes:
+            self._in_speech = False
+            self._voiced_ms = 0.0
+            events.append("end")
+            return events
         if level >= self.threshold:
             self._silence_ms = 0.0
         else:
@@ -138,6 +170,7 @@ class AudioInput:
         self._opener = opener
         self._gated = False
         self._held = False
+        self._saturated = False
         self._buffer = bytearray()
         self._stream = None
         vad = config.audio.vad
@@ -174,21 +207,27 @@ class AudioInput:
             return
         if held and not self._held:
             self._held = True
+            self._saturated = False
             self._buffer = bytearray()
             self._emit("speech_start", None)
             return
         if not held and self._held:
             self._held = False
-            self._finish_ptt()
+            if not self._saturated:
+                self._finish_ptt()
+            self._saturated = False
 
     def on_pcm(self, pcm: bytes) -> None:
         if self._gated or not pcm:
             return
         if self.config.audio.mode == "ptt":
-            if self._held:
+            if self._held and not self._saturated:
                 self._buffer.extend(pcm)
+                if self._over_max(self._buffer):
+                    self._saturated = True
+                    self._finish_ptt()
             return
-        for kind in self._vad.feed(pcm):
+        for kind in self._vad.feed(pcm, max_bytes=self._max_bytes()):
             if kind == "start":
                 self._emit("speech_start", None)
             elif kind == "end":
@@ -202,6 +241,12 @@ class AudioInput:
             log.info("discarded %.0f ms push-to-talk clip", duration_ms)
             return
         self._emit("speech_end", self._write(pcm))
+
+    def _max_bytes(self) -> int:
+        return max(2, int(self.config.audio.sample_rate * self.config.audio.max_utterance_s) * 2)
+
+    def _over_max(self, pcm: bytes) -> bool:
+        return len(pcm) >= self._max_bytes()
 
     def _write(self, pcm: bytes) -> str:
         directory = Path(self.config.paths.audio_dir)
@@ -220,22 +265,34 @@ def open_sounddevice_stream(config: AppConfig, on_pcm):
             "sounddevice is not installed. On the Mac run: pip install -e '.[audio]'"
         ) from exc
 
+    device = config.audio.input_device
+    try:
+        info = sd.query_devices(device, "input")
+        capture_rate = int(round(float(info["default_samplerate"])))
+        sd.check_input_settings(device=device, channels=1, dtype="float32", samplerate=capture_rate)
+    except Exception as exc:
+        raise AudioDependencyError(f"could not open microphone: {exc}") from exc
+    target_rate = config.audio.sample_rate
+
     def callback(indata, frames, time_info, status) -> None:  # noqa: ARG001
         if status:
             log.warning("audio status: %s", status)
         try:
-            on_pcm(floats_to_pcm16(indata))
+            pcm = floats_to_pcm16(indata)
+            if capture_rate != target_rate:
+                pcm = resample_pcm16(pcm, capture_rate, target_rate)
+            on_pcm(pcm)
         except Exception:
             log.exception("audio callback failed")
 
     try:
         stream = sd.InputStream(
-            samplerate=config.audio.sample_rate,
+            samplerate=capture_rate,
             channels=1,
             dtype="float32",
-            device=config.audio.input_device,
+            device=device,
             callback=callback,
-            blocksize=max(1, int(config.audio.sample_rate * 0.02)),
+            blocksize=0,
         )
         stream.start()
     except Exception as exc:

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import logging
-import os
 import shutil
-import signal
 import subprocess
 import sys
 import threading
 
 from orb.config import AppConfig
+from orb.procutil import terminate_group
 
 log = logging.getLogger("orb.playback")
 
@@ -98,12 +97,7 @@ class PlaybackController:
 
 
 def _terminate(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        process.terminate()
+    terminate_group(process, 0.4)
 
 
 class GatedPlayback:

@@ -16,6 +16,17 @@ class SessionState:
     updated_at: str
 
 
+def ensure_private_dir(path: Path) -> None:
+    """Create a directory and tighten it when it is new or belongs to the orb."""
+    created = not path.exists()
+    path.mkdir(parents=True, exist_ok=True)
+    if created or ".codex-voice-orb" in path.parts:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+
+
 class SessionStore:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
@@ -35,7 +46,7 @@ class SessionStore:
         return SessionState(thread_id=thread_id, cwd=cwd if isinstance(cwd, str) else None, updated_at=str(updated))
 
     def save(self, thread_id: str, cwd: str | None) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)
         payload = {
             "thread_id": thread_id,
             "cwd": cwd,

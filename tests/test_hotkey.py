@@ -36,6 +36,18 @@ def test_confirm_fires_once_per_press():
     assert update_hotkey_state(state, ptt, confirm, pressed=True, token="y") == ["confirm"]
 
 
+def test_releasing_one_ctrl_side_keeps_the_other():
+    state = HotkeyState()
+    ptt = parse_hotkey("ctrl+alt+space")
+    confirm = parse_hotkey("ctrl+shift+y")
+    assert update_hotkey_state(state, ptt, confirm, pressed=True, token="ctrl_l") == []
+    assert update_hotkey_state(state, ptt, confirm, pressed=True, token="ctrl_r") == []
+    assert update_hotkey_state(state, ptt, confirm, pressed=True, token="alt_l") == []
+    assert update_hotkey_state(state, ptt, confirm, pressed=True, token="space") == ["ptt_down"]
+    assert update_hotkey_state(state, ptt, confirm, pressed=False, token="ctrl_l") == []
+    assert update_hotkey_state(state, ptt, confirm, pressed=False, token="ctrl_r") == ["ptt_up"]
+
+
 def test_extra_modifier_does_not_match_push_to_talk():
     state = HotkeyState()
     ptt = parse_hotkey("ctrl+space")

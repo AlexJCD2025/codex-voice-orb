@@ -2,10 +2,12 @@ import json
 import threading
 from dataclasses import replace
 
-from orb.backends.base import BackendResult, HighRiskActionBlocked
+from orb.backends.base import BackendResult, CodexCancelled
 from orb.config import AppConfig
 from orb.metrics import MetricsLog
 from orb.orchestrator import Orchestrator
+from orb.permissions import classify_risk
+from orb.plan import ExecutionPlan, PlannedAction, PlanResult
 
 
 class Clock:
@@ -25,22 +27,55 @@ class FakeBackend:
         self.calls = []
         self.text = text
         self.error = None
+        self.side_effects: tuple[str, ...] = ()
         self.always = False
 
     def always_requires_confirmation(self):
         return self.always
 
-    def ask(self, prompt, *, confirmed=False, images=(), cancel=None):
-        self.calls.append({"prompt": prompt, "confirmed": confirmed, "images": tuple(images)})
+    def plan(self, prompt, *, images=(), cancel=None):
+        self.calls.append({"phase": "plan", "prompt": prompt, "images": tuple(images), "confirmed": False})
         if self.clock is not None:
             self.clock.advance(1.5)
         if cancel is not None and cancel.is_set():
-            from orb.backends.base import CodexCancelled
-
             raise CodexCancelled("cancelled")
         if self.error:
             raise self.error
-        return BackendResult(text=self.text, full_text=self.text, session_id="thread-1")
+        if classify_risk(prompt) == "high":
+            kind = "command"
+            if any(word in prompt for word in ("删", "delete", "rm ")):
+                kind = "delete"
+            elif "deploy" in prompt.lower() or "部署" in prompt:
+                kind = "deploy"
+            elif "发邮件" in prompt or "send" in prompt.lower():
+                kind = "send"
+            elif "付款" in prompt or "pay" in prompt.lower():
+                kind = "pay"
+            plan = ExecutionPlan(
+                spoken="将要处理：" + prompt,
+                execute=True,
+                actions=(PlannedAction(kind, prompt, "high"),),
+            )
+        else:
+            plan = ExecutionPlan(spoken=self.text, execute=False, actions=())
+        return PlanResult(plan=plan, session_id="thread-1", side_effects=self.side_effects)
+
+    def execute(self, prompt, actions, *, images=(), resume_id=None, cancel=None):
+        self.calls.append(
+            {
+                "phase": "execute",
+                "prompt": prompt,
+                "actions": tuple(actions),
+                "images": tuple(images),
+                "resume_id": resume_id,
+                "confirmed": True,
+            }
+        )
+        if self.clock is not None:
+            self.clock.advance(1.5)
+        if cancel is not None and cancel.is_set():
+            raise CodexCancelled("cancelled")
+        return BackendResult(text=self.text, full_text=self.text, session_id=resume_id or "thread-1")
 
 
 class FakeTTS:
@@ -134,6 +169,7 @@ def test_low_risk_turn_speaks_summary_and_logs_latency(tmp_path):
     assert result.status == "ok"
     assert result.session_id == "thread-1"
     assert result.summary.startswith("这是口语结论。")
+    assert backend.calls[0]["phase"] == "plan"
     assert backend.calls[0]["prompt"] == "现在几点"
     assert backend.calls[0]["confirmed"] is False
     assert tts.texts[0] == "好。"
@@ -147,26 +183,35 @@ def test_low_risk_turn_speaks_summary_and_logs_latency(tmp_path):
     assert record["transcript_chars"] == len("现在几点")
 
 
-def test_high_risk_waits_for_exact_confirmation(tmp_path):
+def test_high_risk_plans_before_confirmation_and_delete_is_key_only(tmp_path):
     backend = FakeBackend()
     tts = FakeTTS()
+    gated = []
     _config, orchestrator = _orch(tmp_path, backend, tts=tts)
+    orchestrator.set_gated = gated.append
     pending = orchestrator.submit_text("把临时文件删掉")
     assert pending.status == "awaiting_confirmation"
-    assert backend.calls == []
-    assert tts.texts == [orchestrator.config.permissions.confirm_prompt]
-    cancelled = orchestrator.submit_text("先别")
+    assert [call["phase"] for call in backend.calls] == ["plan"]
+    assert gated[-1] is True
+    assert "删除" in tts.texts[-1] or "删掉" in tts.texts[-1]
+    assert "确认键" in tts.texts[-1]
+    assert orchestrator.submit_text("确认").status == "awaiting_confirmation"
+    assert orchestrator.submit_text("好").status == "awaiting_confirmation"
+    assert [call["phase"] for call in backend.calls] == ["plan"]
+    cancelled = orchestrator.submit_text("取消")
     assert cancelled.status == "cancelled"
-    assert backend.calls == []
+    assert gated[-1] is False
 
-    pending = orchestrator.submit_text("把临时文件删掉")
-    confirmed = orchestrator.submit_text("确认")
+    orchestrator.submit_text("把临时文件删掉")
+    confirmed = orchestrator.confirm_with_key()
     assert confirmed.status == "ok"
+    assert backend.calls[-1]["phase"] == "execute"
     assert backend.calls[-1]["confirmed"] is True
     assert backend.calls[-1]["prompt"] == "把临时文件删掉"
+    assert gated[-1] is False
 
 
-def test_no_and_timeout_do_not_call_codex(tmp_path):
+def test_no_and_timeout_do_not_execute(tmp_path):
     clock = Clock()
     backend = FakeBackend(clock)
     _config, orchestrator = _orch(tmp_path, backend, clock=clock)
@@ -175,27 +220,35 @@ def test_no_and_timeout_do_not_call_codex(tmp_path):
     orchestrator.submit_text("请删除缓存")
     clock.advance(11)
     assert orchestrator.poll().status == "timeout"
-    assert backend.calls == []
+    assert [call["phase"] for call in backend.calls] == ["plan", "plan"]
 
 
-def test_confirm_key(tmp_path):
+def test_confirm_key_and_voice_yes_for_a_command(tmp_path):
     backend = FakeBackend()
     _config, orchestrator = _orch(tmp_path, backend)
     orchestrator.submit_text("git push origin main")
     result = orchestrator.confirm_with_key()
     assert result.status == "ok"
-    assert backend.calls[0]["confirmed"] is True
+    assert backend.calls[-1]["phase"] == "execute"
+    assert backend.calls[-1]["confirmed"] is True
+
+    orchestrator.submit_text("git push origin main")
+    voiced = orchestrator.submit_text("yes")
+    assert voiced.status == "ok"
+    assert backend.calls[-1]["phase"] == "execute"
 
 
-def test_unconfirmed_tool_block_is_spoken(tmp_path):
+def test_plan_side_effect_asks_before_a_second_process(tmp_path):
     backend = FakeBackend()
-    backend.error = HighRiskActionBlocked("rm -rf /tmp/x")
+    backend.side_effects = ("rm -rf /tmp/x",)
     tts = FakeTTS()
     _config, orchestrator = _orch(tmp_path, backend, tts=tts)
     result = orchestrator.submit_text("列一下文件")
-    assert result.status == "blocked"
-    assert tts.texts[-1] == orchestrator.config.permissions.blocked_message
-    assert "rm -rf" not in tts.texts[-1]
+    assert result.status == "awaiting_confirmation"
+    assert [call["phase"] for call in backend.calls] == ["plan"]
+    assert "rm -rf /tmp/x" in tts.texts[-1]
+    assert orchestrator.submit_text("确认").status == "awaiting_confirmation"
+    assert len(backend.calls) == 1
 
 
 def test_barge_in_during_ack_skips_codex(tmp_path):

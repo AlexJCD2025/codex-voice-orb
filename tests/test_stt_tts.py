@@ -67,6 +67,7 @@ def test_whisper_cpp_argv(tmp_path):
     wav.write_bytes(b"")
     try:
         assert WhisperSTT(config).transcribe(str(wav)) == "中文结果"
+        assert not (tmp_path / "in.txt").exists()
     finally:
         monkeypatch.undo()
 

@@ -1,7 +1,7 @@
-"""Coarse risk screen and spoken/key confirmation matching.
+"""Coarse risk hints and exact confirmation words.
 
-The screen is intentionally fail-closed: a keyword hit asks for confirmation
-before Codex starts. It does not replace the Codex sandbox.
+Keywords do not start a write-sandbox process. The orchestrator plans in a
+read-only sandbox first, then asks before a separate execute process.
 """
 
 from __future__ import annotations
@@ -70,21 +70,9 @@ _COMMANDS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in _COMMAND_SOU
 
 _YES = {
     "yes",
-    "yeah",
-    "yep",
-    "ok",
-    "okay",
     "confirm",
     "confirmed",
     "确认",
-    "好",
-    "好的",
-    "可以",
-    "同意",
-    "执行",
-    "是",
-    "对",
-    "嗯",
 }
 _NO = {
     "no",

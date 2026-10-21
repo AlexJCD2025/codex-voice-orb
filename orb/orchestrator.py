@@ -1,4 +1,4 @@
-"""One voice turn: transcribe, confirm if needed, ask Codex, speak a short summary."""
+"""One voice turn: read-only plan, confirm concrete actions, then execute."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TextIO
+from typing import Callable, TextIO
 
 from orb.backends.base import (
     BackendError,
@@ -22,7 +22,15 @@ from orb.backends.base import (
 from orb.codex_safety import UnsafeCodexInvocation
 from orb.config import AppConfig
 from orb.metrics import MetricsLog, TurnMetrics
-from orb.permissions import classify_confirmation, classify_risk
+from orb.permissions import classify_confirmation
+from orb.plan import (
+    PlannedAction,
+    PlanResult,
+    concrete_actions,
+    confirmation_text,
+    is_key_only,
+    needs_execute_confirmation,
+)
 from orb.stt import is_usable_transcript
 from orb.summary import spoken_summary
 
@@ -49,6 +57,7 @@ class _Turn:
     transcript: str
     risk: str
     images: tuple[str, ...] = ()
+    actions: tuple[PlannedAction, ...] = ()
     confirmed: bool = False
     interrupted: bool = False
     stt_ms: int | None = None
@@ -59,6 +68,15 @@ class _Turn:
     session_id: str | None = None
     reply_chars: int = 0
     error: str | None = None
+
+
+@dataclass
+class _Pending:
+    nonce: str
+    deadline: float
+    turn: _Turn
+    key_only: bool
+    side_effects: tuple[str, ...] = field(default_factory=tuple)
 
 
 class Orchestrator:
@@ -74,6 +92,7 @@ class Orchestrator:
         timer=None,
         clock=None,
         stdout: TextIO | None = None,
+        set_gated: Callable[[bool], None] | None = None,
     ):
         self.config = config
         self.backend = backend
@@ -84,11 +103,11 @@ class Orchestrator:
         self.timer = timer or time.perf_counter
         self.clock = clock or time.monotonic
         self.stdout = stdout or sys.stdout
+        self.set_gated = set_gated or (lambda _gated: None)
         self.phase = "idle"
         self._lock = threading.Lock()
         self._cancel = CancelToken()
-        self._pending: _Turn | None = None
-        self._pending_deadline: float | None = None
+        self._pending: _Pending | None = None
 
     def handle_wav(self, wav_path: str) -> TurnResult:
         with self._lock:
@@ -109,8 +128,8 @@ class Orchestrator:
             if self.config.paths.delete_audio_after_stt:
                 try:
                     os.remove(wav_path)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    log.warning("could not delete utterance %s: %s", wav_path, exc)
         stt_ms = _ms(self.timer() - started)
         if self._cancel.is_set():
             return TurnResult(status="interrupted", transcript=text or "")
@@ -128,36 +147,26 @@ class Orchestrator:
         stt_ms: int | None = None,
         images: tuple[str, ...] | list[str] = (),
     ) -> TurnResult:
-        pending = self._pending
-        if pending is not None and key_confirm:
-            return self._execute(pending, confirmed=True)
-        if pending is not None:
-            return self._resolve_voice(text, pending)
+        if self._pending is not None and key_confirm:
+            return self._confirm_with_key()
+        if self._pending is not None:
+            return self._resolve_voice(text)
         if key_confirm:
             return TurnResult(status="ignored")
         cleaned = text.strip()
+        if classify_confirmation(cleaned) == "yes":
+            return TurnResult(status="ignored", transcript=cleaned)
         if not is_usable_transcript(cleaned):
             return TurnResult(status="empty", transcript=cleaned)
-        risk = "high" if self._needs_confirmation(cleaned) else "low"
-        turn = self._new_turn(cleaned, risk, stt_ms)
+        turn = self._new_turn(cleaned, "low", stt_ms)
         turn.images = tuple(images)
-        if risk == "high":
-            with self._lock:
-                self._pending = turn
-                self._pending_deadline = self.clock() + self.config.permissions.confirm_timeout_s
-                self.phase = "awaiting_confirmation"
-            self._emit(self.config.permissions.confirm_prompt)
-            self._speak(self.config.permissions.confirm_prompt, turn)
-            with self._lock:
-                if self._pending is turn and not self._cancel.is_set():
-                    self.phase = "awaiting_confirmation"
-            return TurnResult(
-                status="awaiting_confirmation",
-                turn_id=turn.turn_id,
-                transcript=cleaned,
-                risk=risk,
-            )
-        return self._execute(turn, confirmed=False)
+        if self.config.tts.ack and not self._speak(self.config.tts.ack, turn):
+            self._finish(turn, "interrupted")
+            return self._result(turn, "interrupted")
+        if self._cancel.is_set():
+            self._finish(turn, "interrupted")
+            return self._result(turn, "interrupted")
+        return self._run_plan(turn)
 
     def confirm_with_key(self) -> TurnResult:
         return self.submit_text("", key_confirm=True)
@@ -180,31 +189,60 @@ class Orchestrator:
         token.cancel()
         self.playback.stop()
 
+    def confirmation_remaining(self) -> float | None:
+        with self._lock:
+            pending = self._pending
+            if pending is None:
+                return None
+            return pending.deadline - self.clock()
+
     def poll(self) -> TurnResult | None:
         with self._lock:
-            turn = self._pending
-            deadline = self._pending_deadline
-            if turn is None or deadline is None or self.clock() < deadline:
+            pending = self._pending
+            if pending is None or self.clock() < pending.deadline:
                 return None
             self._pending = None
-            self._pending_deadline = None
-        self._emit(self.config.permissions.timeout_message)
-        self._speak(self.config.permissions.timeout_message, turn)
-        self._finish(turn, "timeout")
-        return TurnResult(status="timeout", turn_id=turn.turn_id, transcript=turn.transcript, risk=turn.risk)
+            turn = pending.turn
+        self._set_gated(False)
+        return self._timeout_turn(turn)
 
-    def _needs_confirmation(self, text: str) -> bool:
-        if classify_risk(text) == "high":
-            return True
-        checker = getattr(self.backend, "always_requires_confirmation", None)
-        return bool(checker and checker())
-
-    def _resolve_voice(self, text: str, turn: _Turn) -> TurnResult:
+    def _resolve_voice(self, text: str) -> TurnResult:
         decision = classify_confirmation(text)
-        if decision == "yes":
-            return self._execute(turn, confirmed=True)
-        self._clear_pending()
-        if decision == "no":
+        with self._lock:
+            pending = self._pending
+            if pending is None:
+                return TurnResult(status="ignored", transcript=text)
+            turn = pending.turn
+            if self.clock() >= pending.deadline:
+                self._pending = None
+                action = "expired"
+            elif decision == "yes" and pending.key_only:
+                return TurnResult(
+                    status="awaiting_confirmation",
+                    turn_id=turn.turn_id,
+                    transcript=turn.transcript,
+                    risk=turn.risk,
+                )
+            elif decision != "yes" and decision != "no" and pending.key_only:
+                return TurnResult(
+                    status="awaiting_confirmation",
+                    turn_id=turn.turn_id,
+                    transcript=turn.transcript,
+                    risk=turn.risk,
+                )
+            elif decision == "yes":
+                self._pending = None
+                action = "execute"
+            else:
+                self._pending = None
+                action = "no" if decision == "no" else "unclear"
+        if action == "expired":
+            self._set_gated(False)
+            return self._timeout_turn(turn)
+        if action == "execute":
+            return self._run_execute(turn)
+        self._set_gated(False)
+        if action == "no":
             message = self.config.permissions.cancel_message
         else:
             message = self.config.permissions.unclear_message
@@ -213,10 +251,24 @@ class Orchestrator:
         self._finish(turn, "cancelled")
         return TurnResult(status="cancelled", turn_id=turn.turn_id, transcript=turn.transcript, risk=turn.risk)
 
-    def _execute(self, turn: _Turn, *, confirmed: bool) -> TurnResult:
-        self._clear_pending()
-        turn.confirmed = confirmed
-        turn.permission_ms = max(0, _ms(self.timer() - turn.started) - (turn.stt_ms or 0))
+    def _confirm_with_key(self) -> TurnResult:
+        with self._lock:
+            pending = self._pending
+            if pending is None:
+                return TurnResult(status="ignored")
+            turn = pending.turn
+            if self.clock() >= pending.deadline:
+                self._pending = None
+                expired = True
+            else:
+                self._pending = None
+                expired = False
+        self._set_gated(False)
+        if expired:
+            return self._timeout_turn(turn)
+        return self._run_execute(turn)
+
+    def _run_plan(self, turn: _Turn) -> TurnResult:
         with self._lock:
             if self._cancel.is_set():
                 already = True
@@ -226,23 +278,10 @@ class Orchestrator:
         if already:
             self._finish(turn, "interrupted")
             return self._result(turn, "interrupted")
-        if self.config.tts.ack and not self._speak(self.config.tts.ack, turn):
-            self._finish(turn, "interrupted")
-            return self._result(turn, "interrupted")
-        if self._cancel.is_set():
-            self._finish(turn, "interrupted")
-            return self._result(turn, "interrupted")
-        self._emit("已发给 Codex，正在等回复。")
-        with self._lock:
-            self.phase = "thinking"
+        self._emit("已发给 Codex 做只读规划。")
         started = self.timer()
         try:
-            result = self.backend.ask(
-                turn.transcript,
-                confirmed=confirmed,
-                images=turn.images,
-                cancel=self._cancel,
-            )
+            planned = self.backend.plan(turn.transcript, images=turn.images, cancel=self._cancel)
         except CodexCancelled:
             turn.codex_ms = _ms(self.timer() - started)
             self._finish(turn, "interrupted")
@@ -255,38 +294,134 @@ class Orchestrator:
             self._finish(turn, "blocked")
             return self._result(turn, "blocked", error=str(exc))
         except (UnsafeCodexInvocation, CodexExecError, BackendError) as exc:
-            turn.codex_ms = _ms(self.timer() - started)
-            turn.error = str(exc)
-            self._emit(f"Codex 执行失败：{exc}")
-            self._speak("Codex 执行失败。", turn)
-            self._finish(turn, "error")
-            return self._result(turn, "error", error=str(exc))
+            return self._backend_error(turn, started, exc)
         except Exception as exc:
-            log.exception("backend failed")
-            turn.codex_ms = _ms(self.timer() - started)
-            turn.error = str(exc)
-            self._emit(f"Codex 执行失败：{exc}")
-            self._finish(turn, "error")
-            return self._result(turn, "error", error=str(exc))
+            log.exception("plan failed")
+            return self._backend_error(turn, started, exc)
+        if not isinstance(planned, PlanResult):
+            planned = _coerce_plan(planned)
         turn.codex_ms = _ms(self.timer() - started)
-        turn.session_id = result.session_id
-        turn.reply_chars = len(result.text or "")
+        turn.session_id = planned.session_id
         if self._cancel.is_set():
             self._finish(turn, "interrupted")
-            return self._result(turn, "interrupted", reply=result.text, session_id=result.session_id)
+            return self._result(turn, "interrupted", reply=planned.text, session_id=planned.session_id)
+        actions = concrete_actions(planned.plan, planned.side_effects)
+        if not needs_execute_confirmation(planned.plan, planned.side_effects):
+            return self._speak_answer(turn, planned.text, planned.session_id)
+        turn.actions = actions
+        turn.risk = "high"
+        key_only = is_key_only(actions, turn.transcript, self.config.codex.sandbox)
+        prompt = confirmation_text(actions, planned.side_effects, key_only=key_only)
+        nonce = uuid.uuid4().hex
+        with self._lock:
+            if self._cancel.is_set():
+                cancelled = True
+            else:
+                cancelled = False
+                self._pending = _Pending(
+                    nonce=nonce,
+                    deadline=self.clock() + self.config.permissions.confirm_timeout_s,
+                    turn=turn,
+                    key_only=key_only,
+                    side_effects=planned.side_effects,
+                )
+                self.phase = "awaiting_confirmation"
+        if cancelled:
+            self._finish(turn, "interrupted")
+            return self._result(turn, "interrupted", reply=planned.text, session_id=planned.session_id)
+        self._set_gated(True)
+        self._emit(prompt)
+        self._speak(prompt, turn)
+        with self._lock:
+            pending = self._pending
+            if pending is not None and pending.nonce == nonce and not self._cancel.is_set():
+                self.phase = "awaiting_confirmation"
+        return TurnResult(
+            status="awaiting_confirmation",
+            turn_id=turn.turn_id,
+            transcript=turn.transcript,
+            risk=turn.risk,
+            session_id=turn.session_id,
+        )
+
+    def _run_execute(self, turn: _Turn) -> TurnResult:
+        self._set_gated(False)
+        turn.confirmed = True
+        turn.permission_ms = max(0, _ms(self.timer() - turn.started) - (turn.stt_ms or 0))
+        with self._lock:
+            if self._cancel.is_set():
+                already = True
+            else:
+                already = False
+                self.phase = "thinking"
+        if already:
+            self._finish(turn, "interrupted")
+            return self._result(turn, "interrupted")
+        if not self._speak("开始执行。", turn):
+            self._finish(turn, "interrupted")
+            return self._result(turn, "interrupted")
+        if self._cancel.is_set():
+            self._finish(turn, "interrupted")
+            return self._result(turn, "interrupted")
+        self._emit("已确认，开始执行。")
+        with self._lock:
+            self.phase = "thinking"
+        started = self.timer()
+        try:
+            result = self.backend.execute(
+                turn.transcript,
+                turn.actions,
+                images=() if turn.session_id else turn.images,
+                resume_id=turn.session_id,
+                cancel=self._cancel,
+            )
+        except CodexCancelled:
+            turn.codex_ms = (turn.codex_ms or 0) + _ms(self.timer() - started)
+            self._finish(turn, "interrupted")
+            return self._result(turn, "interrupted")
+        except (UnsafeCodexInvocation, CodexExecError, BackendError) as exc:
+            return self._backend_error(turn, started, exc, add=True)
+        except Exception as exc:
+            log.exception("execute failed")
+            return self._backend_error(turn, started, exc, add=True)
+        turn.codex_ms = (turn.codex_ms or 0) + _ms(self.timer() - started)
+        turn.session_id = result.session_id or turn.session_id
+        return self._speak_answer(turn, result.text, turn.session_id, full_text=result.full_text)
+
+    def _speak_answer(self, turn: _Turn, text: str, session_id: str | None, full_text: str | None = None) -> TurnResult:
+        turn.reply_chars = len(text or "")
+        turn.session_id = session_id
+        if self._cancel.is_set():
+            self._finish(turn, "interrupted")
+            return self._result(turn, "interrupted", reply=text, session_id=session_id)
         summary = spoken_summary(
-            result.text,
+            text,
             max_chars=self.config.tts.max_chars,
             max_sentences=self.config.tts.max_sentences,
         )
         self._emit(f"你说：{turn.transcript}")
-        self._emit(f"Codex：{result.full_text}")
+        self._emit(f"Codex：{full_text if full_text is not None else text}")
         self._emit(f"朗读：{summary}")
         if not self._speak(summary, turn):
             self._finish(turn, "interrupted")
-            return self._result(turn, "interrupted", reply=result.text, summary=summary, session_id=result.session_id)
+            return self._result(turn, "interrupted", reply=text, summary=summary, session_id=session_id)
         self._finish(turn, "ok")
-        return self._result(turn, "ok", reply=result.text, summary=summary, session_id=result.session_id)
+        return self._result(turn, "ok", reply=text, summary=summary, session_id=session_id)
+
+    def _backend_error(self, turn: _Turn, started: float, exc: Exception, *, add: bool = False) -> TurnResult:
+        elapsed = _ms(self.timer() - started)
+        turn.codex_ms = (turn.codex_ms or 0) + elapsed if add else elapsed
+        turn.error = str(exc)
+        self._emit(f"Codex 执行失败：{exc}")
+        self._speak("Codex 执行失败。", turn)
+        self._finish(turn, "error")
+        return self._result(turn, "error", error=str(exc))
+
+    def _timeout_turn(self, turn: _Turn) -> TurnResult:
+        self._emit(self.config.permissions.timeout_message)
+        self._speak(self.config.permissions.timeout_message, turn)
+        self._finish(turn, "timeout")
+        return TurnResult(status="timeout", turn_id=turn.turn_id, transcript=turn.transcript, risk=turn.risk)
 
     def _speak(self, text: str, turn: _Turn) -> bool:
         if not text or self._cancel.is_set():
@@ -303,9 +438,11 @@ class Orchestrator:
             return not self._cancel.is_set()
         turn.tts_ms = (turn.tts_ms or 0) + _ms(self.timer() - started)
         if self._cancel.is_set():
+            self._delete_tts(path)
             return False
         with self._lock:
             if self._cancel.is_set():
+                self._delete_tts(path)
                 return False
             self.phase = "speaking"
         play_started = self.timer()
@@ -318,9 +455,18 @@ class Orchestrator:
             log.warning("playback failed: %s", exc)
         finally:
             turn.playback_ms = (turn.playback_ms or 0) + _ms(self.timer() - play_started)
+            self._delete_tts(path)
         with self._lock:
             interrupted = self.phase == "interrupted" or self._cancel.is_set()
         return not interrupted
+
+    def _delete_tts(self, path: str) -> None:
+        if not path or not self.config.tts.delete_after_playback:
+            return
+        try:
+            os.remove(path)
+        except OSError as exc:
+            log.warning("could not delete tts audio %s: %s", path, exc)
 
     def _new_turn(self, transcript: str, risk: str, stt_ms: int | None) -> _Turn:
         with self._lock:
@@ -339,10 +485,11 @@ class Orchestrator:
             risk="low",
         )
 
-    def _clear_pending(self) -> None:
-        with self._lock:
-            self._pending = None
-            self._pending_deadline = None
+    def _set_gated(self, gated: bool) -> None:
+        try:
+            self.set_gated(gated)
+        except Exception:
+            log.warning("mic gate failed", exc_info=True)
 
     def _finish(self, turn: _Turn, status: str) -> None:
         if status == "interrupted":
@@ -393,6 +540,18 @@ class Orchestrator:
     def _emit(self, text: str) -> None:
         print(text, file=self.stdout)
         self.stdout.flush()
+
+
+def _coerce_plan(value: object) -> PlanResult:
+    from orb.plan import ExecutionPlan
+
+    text = str(getattr(value, "text", "") or "")
+    session_id = getattr(value, "session_id", None)
+    return PlanResult(
+        plan=ExecutionPlan(spoken=text, execute=False, actions=()),
+        session_id=session_id if isinstance(session_id, str) else None,
+        raw_text=text,
+    )
 
 
 def _ms(seconds: float) -> int:

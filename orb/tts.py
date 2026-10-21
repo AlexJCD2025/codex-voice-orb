@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 from orb.config import AppConfig
+from orb.session import ensure_private_dir
 
 
 class TTSError(RuntimeError):
@@ -24,7 +26,7 @@ class SayTTS:
         if not spoken:
             return ""
         output_dir = Path(self.config.tts.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(output_dir)
         self._count += 1
         path = output_dir / f"{turn_id}-{self._count}.aiff"
         argv = ["say", "-o", str(path)]
@@ -48,6 +50,8 @@ class SayTTS:
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "say failed").strip()
             raise TTSError(detail[-1000:])
+        if path.is_file():
+            os.chmod(path, 0o600)
         return str(path)
 
 

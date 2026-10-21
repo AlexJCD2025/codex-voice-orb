@@ -35,7 +35,7 @@ def doctor_exit_code(checks: list[Check]) -> int:
     return 1 if any(check.status == "fail" for check in checks) else 0
 
 
-def run_doctor(config: AppConfig, probes: dict | None = None) -> list[Check]:
+def run_doctor(config: AppConfig, probes: dict | None = None, *, hotkey: bool = False) -> list[Check]:
     probes = probes or default_probes()
     codex_check, codex_bin = _guard("codex", lambda: check_codex(config, probes))
     checks = [
@@ -46,6 +46,7 @@ def run_doctor(config: AppConfig, probes: dict | None = None) -> list[Check]:
         _guard("stt", lambda: check_stt(config)),
         _guard("tts", lambda: check_tts(config)),
         _guard("playback", lambda: check_playback(config)),
+        _guard("hotkey", lambda: check_hotkey(config, interactive=hotkey)),
     ]
     return checks
 
@@ -53,21 +54,26 @@ def run_doctor(config: AppConfig, probes: dict | None = None) -> list[Check]:
 def default_probes() -> dict:
     return {
         "list_inputs": _default_list_inputs,
+        "check_input_settings": _default_check_input,
         "which": shutil.which,
         "run": _default_run,
     }
 
 
 def check_safety(config: AppConfig) -> Check:
-    if config.permissions.allow_full_auto or config.permissions.allow_danger_full_access:
+    if config.permissions.allow_danger_full_access or config.codex.sandbox == "danger-full-access":
         return Check(
             "safety",
             "warn",
-            "full-auto or danger-full-access is opted in; each such turn still waits for spoken or key confirmation",
+            "danger-full-access is opted in; the plan turn stays read-only and execute waits for the confirm key",
         )
     if config.codex.sandbox not in {"read-only", "workspace-write"}:
         return Check("safety", "fail", f"sandbox {config.codex.sandbox} is not a default sandbox")
-    return Check("safety", "pass", f"sandbox {config.codex.sandbox}; full-auto is off")
+    return Check(
+        "safety",
+        "pass",
+        f"plan sandbox read-only; execute sandbox {config.codex.sandbox}; yolo is refused",
+    )
 
 
 def check_microphone(config: AppConfig, probes: dict) -> Check:
@@ -80,13 +86,27 @@ def check_microphone(config: AppConfig, probes: dict) -> Check:
     wanted = config.audio.input_device
     names = ", ".join(str(device.get("name")) for device in devices[:8])
     if wanted is None:
-        return Check("microphone", "pass", f"default input available; devices: {names}")
-    wanted_text = str(wanted)
-    for device in devices:
-        name = str(device.get("name") or "")
-        if str(device.get("index")) == wanted_text or wanted_text.casefold() in name.casefold():
-            return Check("microphone", "pass", f"found {name} (index {device.get('index')})")
-    return Check("microphone", "fail", f"input device {wanted_text} not found; have: {names}")
+        result = Check("microphone", "pass", f"default input available; devices: {names}")
+    else:
+        wanted_text = str(wanted)
+        result = None
+        for device in devices:
+            name = str(device.get("name") or "")
+            if str(device.get("index")) == wanted_text or wanted_text.casefold() in name.casefold():
+                result = Check("microphone", "pass", f"found {name} (index {device.get('index')})")
+                break
+        if result is None:
+            return Check("microphone", "fail", f"input device {wanted_text} not found; have: {names}")
+    checker = probes.get("check_input_settings")
+    if checker is None or result.status != "pass":
+        return result
+    try:
+        detail = checker(config)
+    except Exception as exc:
+        return Check("microphone", "fail", f"input settings: {exc}")
+    if detail:
+        return Check("microphone", "pass", result.detail + "; " + str(detail))
+    return result
 
 
 def check_codex(config: AppConfig, probes: dict) -> tuple[Check, str | None]:
@@ -104,7 +124,12 @@ def check_codex(config: AppConfig, probes: dict) -> tuple[Check, str | None]:
         return Check("codex", "fail", detail[:500]), binary
     version_text = (out or err).strip()
     version = version_text.splitlines()[0] if version_text else "unknown version"
-    return Check("codex", "pass", f"{binary}: {version}"), binary
+    detail = f"{binary}: {version}"
+    status = "pass"
+    if Path(binary).name != "codex":
+        status = "warn"
+        detail = f"{binary}: {version}; basename is not codex"
+    return Check("codex", status, detail), binary
 
 
 def check_codex_auth(binary: str | None, probes: dict) -> Check:
@@ -160,6 +185,38 @@ def check_tts(config: AppConfig) -> Check:
     return Check("tts", "pass", detail)
 
 
+def check_hotkey(config: AppConfig, *, interactive: bool = False) -> Check:
+    detail = (
+        f"hotkey {config.audio.hotkey} is not proof of permission. "
+        "Starting a listener does not mean macOS delivered the keys. "
+        "Check Input Monitoring, Accessibility, and Secure Keyboard Entry. "
+        "Pass --hotkey to wait five seconds for one key."
+    )
+    if not interactive:
+        return Check("hotkey", "warn", detail)
+    try:
+        from pynput import keyboard
+    except ImportError:
+        return Check("hotkey", "fail", "pynput is not installed; cannot test Input Monitoring")
+    import threading
+
+    got = threading.Event()
+
+    def on_press(_key):
+        got.set()
+        return False
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    try:
+        ok = got.wait(5)
+    finally:
+        listener.stop()
+    if ok:
+        return Check("hotkey", "pass", "received one key")
+    return Check("hotkey", "warn", "no key in 5s. " + detail)
+
+
 def check_playback(config: AppConfig) -> Check:
     try:
         command = resolve_player(config.playback.player)
@@ -203,6 +260,16 @@ def _default_list_inputs():
     from orb.audio import list_input_devices
 
     return list_input_devices()
+
+
+def _default_check_input(config: AppConfig) -> str:
+    import sounddevice as sd
+
+    device = config.audio.input_device
+    info = sd.query_devices(device, "input") if device is not None else sd.query_devices(kind="input")
+    rate = int(round(float(info["default_samplerate"])))
+    sd.check_input_settings(device=device, channels=1, dtype="float32", samplerate=rate)
+    return f"default rate {rate}"
 
 
 def _default_run(argv: list[str], timeout: float) -> tuple[int, str, str]:

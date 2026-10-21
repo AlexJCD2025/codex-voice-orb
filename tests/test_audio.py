@@ -1,7 +1,7 @@
 import wave
 from pathlib import Path
 
-from orb.audio import AudioInput, RMSVAD, floats_to_pcm16, rms_pcm16, write_wav
+from orb.audio import AudioInput, RMSVAD, floats_to_pcm16, resample_pcm16, rms_pcm16, write_wav
 from orb.config import AppConfig
 
 
@@ -93,9 +93,71 @@ def test_gate_drops_vad_audio(tmp_path: Path):
 
 
 def test_write_wav_round_trip(tmp_path: Path):
-    path = write_wav(tmp_path / "a.wav", _pcm(20, 1000), 16000)
+    path = write_wav(tmp_path / "nested" / "a.wav", _pcm(20, 1000), 16000)
     with wave.open(path) as handle:
         assert handle.readframes(handle.getnframes()) == _pcm(20, 1000)
+    assert (tmp_path / "nested").stat().st_mode & 0o777 == 0o700
+    assert Path(path).stat().st_mode & 0o777 == 0o600
+
+
+def test_sounddevice_uses_device_rate_and_default_blocksize(monkeypatch):
+    import sys
+    import types
+
+    fake = types.ModuleType("sounddevice")
+    fake.last = {}
+    fake.checked = {}
+
+    def query_devices(device, kind):
+        assert kind == "input"
+        return {"default_samplerate": 48000.0}
+
+    def check_input_settings(**kwargs):
+        fake.checked = kwargs
+
+    class InputStream:
+        def __init__(self, **kwargs):
+            fake.last = kwargs
+
+        def start(self):
+            return None
+
+    fake.query_devices = query_devices
+    fake.check_input_settings = check_input_settings
+    fake.InputStream = InputStream
+    monkeypatch.setitem(sys.modules, "sounddevice", fake)
+    from orb.audio import open_sounddevice_stream
+
+    open_sounddevice_stream(AppConfig(), lambda _pcm: None)
+    assert fake.checked["samplerate"] == 48000
+    assert fake.last["samplerate"] == 48000
+    assert fake.last["blocksize"] == 0
+
+
+def test_resample_changes_length():
+    pcm = _pcm(1000, 1000, rate=16000)
+    out = resample_pcm16(pcm, 16000, 8000)
+    assert abs(len(out) // 2 - 8000) <= 1
+
+
+def test_push_to_talk_stops_at_max_utterance(tmp_path: Path):
+    config = AppConfig()
+    audio_config = config.audio.__class__(
+        mode="ptt",
+        sample_rate=16000,
+        min_utterance_ms=50,
+        max_utterance_s=0.2,
+        vad=config.audio.vad,
+    )
+    paths = config.paths.__class__(audio_dir=str(tmp_path), delete_audio_after_stt=True)
+    config = config.__class__(**{**config.__dict__, "audio": audio_config, "paths": paths})
+    events = []
+    audio = AudioInput(config, events.append)
+    audio.set_ptt(True)
+    audio.on_pcm(_pcm(300, 8000))
+    assert events[-1].kind == "speech_end"
+    audio.on_pcm(_pcm(300, 8000))
+    assert [event.kind for event in events].count("speech_end") == 1
 
 
 def test_vad_class_end_event():

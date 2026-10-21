@@ -61,12 +61,21 @@ class BackendResult:
 
 
 class Backend(Protocol):
-    def ask(
+    def plan(
         self,
         prompt: str,
         *,
-        confirmed: bool = False,
         images: Sequence[str] = (),
+        cancel: CancelToken | None = None,
+    ) -> object: ...
+
+    def execute(
+        self,
+        prompt: str,
+        actions: Sequence[object],
+        *,
+        images: Sequence[str] = (),
+        resume_id: str | None = None,
         cancel: CancelToken | None = None,
     ) -> BackendResult: ...
 

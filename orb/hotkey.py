@@ -77,11 +77,26 @@ def update_hotkey_state(state: HotkeyState, ptt: HotkeyChord, confirm: HotkeyCho
     return actions
 
 
+_SIDES = {
+    "ctrl": ("ctrl", "ctrl_l", "ctrl_r"),
+    "alt": ("alt", "alt_l", "alt_r"),
+    "shift": ("shift", "shift_l", "shift_r"),
+    "cmd": ("cmd", "cmd_l", "cmd_r"),
+}
+
+
+def _held_modifiers(pressed: set[str]) -> set[str]:
+    held: set[str] = set()
+    for name, tokens in _SIDES.items():
+        if any(token in pressed for token in tokens):
+            held.add(name)
+    return held
+
+
 def _matches(state: HotkeyState, chord: HotkeyChord) -> bool:
     if chord.key not in state.pressed:
         return False
-    held_mods = state.pressed & {"ctrl", "alt", "shift", "cmd"}
-    return held_mods == set(chord.modifiers)
+    return _held_modifiers(state.pressed) == set(chord.modifiers)
 
 
 class HotkeyListener:
@@ -132,17 +147,17 @@ class HotkeyListener:
             return None
         mapping = {
             keyboard.Key.ctrl: "ctrl",
-            keyboard.Key.ctrl_l: "ctrl",
-            keyboard.Key.ctrl_r: "ctrl",
+            keyboard.Key.ctrl_l: "ctrl_l",
+            keyboard.Key.ctrl_r: "ctrl_r",
             keyboard.Key.alt: "alt",
-            keyboard.Key.alt_l: "alt",
-            keyboard.Key.alt_r: "alt",
+            keyboard.Key.alt_l: "alt_l",
+            keyboard.Key.alt_r: "alt_r",
             keyboard.Key.shift: "shift",
-            keyboard.Key.shift_l: "shift",
-            keyboard.Key.shift_r: "shift",
+            keyboard.Key.shift_l: "shift_l",
+            keyboard.Key.shift_r: "shift_r",
             keyboard.Key.cmd: "cmd",
-            keyboard.Key.cmd_l: "cmd",
-            keyboard.Key.cmd_r: "cmd",
+            keyboard.Key.cmd_l: "cmd_l",
+            keyboard.Key.cmd_r: "cmd_r",
         }
         if key in mapping:
             return mapping[key]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -89,9 +90,17 @@ class WhisperSTT:
         except FileNotFoundError as exc:
             raise STTError(f"whisper.cpp binary not found: {self.config.stt.whisper_cpp_bin}") from exc
         transcript_path = Path(output_base + ".txt")
-        if transcript_path.is_file():
-            return transcript_path.read_text(encoding="utf-8").strip()
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "whisper.cpp failed").strip()
-            raise STTError(detail[-2000:])
-        return (completed.stdout or "").strip()
+        try:
+            if transcript_path.is_file():
+                os.chmod(transcript_path, 0o600)
+                return transcript_path.read_text(encoding="utf-8").strip()
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "whisper.cpp failed").strip()
+                raise STTError(detail[-2000:])
+            return (completed.stdout or "").strip()
+        finally:
+            if transcript_path.is_file():
+                try:
+                    transcript_path.unlink()
+                except OSError as exc:
+                    log.warning("could not delete whisper transcript %s: %s", transcript_path, exc)
