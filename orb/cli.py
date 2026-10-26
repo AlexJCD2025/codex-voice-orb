@@ -158,29 +158,39 @@ def _read_stdin(timeout: float) -> str | None:
     return line.rstrip("\n")
 
 
+def _stdin_can_wait() -> bool:
+    """A real terminal or pipe can wait. StringIO cannot, and readline would skip ahead."""
+    try:
+        select.select([sys.stdin], [], [], 0)
+    except (TypeError, ValueError, OSError):
+        return False
+    return True
+
+
 def _listen_stdin(runtime) -> int:
-    print("输入文字后回车。空行退出。需要执行时会先做只读规划，再等确认。", flush=True)
+    print("输入文字后回车。空行退出。正在做的时候可以输入「后台做」或「停」。", flush=True)
     while True:
-        remaining = runtime.orchestrator.confirmation_remaining()
-        if remaining is not None:
-            line = _read_stdin(max(0.0, remaining))
-            if line is None:
-                runtime.orchestrator.poll()
-                continue
-            if line == "":
-                return 0
-            runtime.orchestrator.submit_text(line)
-            runtime.orchestrator.poll()
-            continue
-        try:
-            line = input("> ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
-        if not line.strip():
-            return 0
-        runtime.orchestrator.submit_text(line)
         runtime.orchestrator.poll()
+        job_running = runtime.orchestrator.is_running()
+        if runtime.orchestrator.needs_poll() and job_running and not _stdin_can_wait():
+            time.sleep(0.02)
+            continue
+        if runtime.orchestrator.needs_poll() and _stdin_can_wait():
+            line = _read_stdin(0.2)
+            if line is None:
+                continue
+        else:
+            try:
+                line = input("> ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                runtime.orchestrator.shutdown()
+                return 0
+        if not line.strip():
+            if runtime.orchestrator.needs_poll():
+                runtime.orchestrator.shutdown()
+            return 0
+        runtime.orchestrator.submit_text(line, wait=False)
 
 
 def _listen_audio(runtime) -> int:
@@ -229,11 +239,12 @@ def _listen_audio(runtime) -> int:
         return 1
     if config.audio.mode == "ptt":
         print(
-            f"正在听。按住 {config.audio.hotkey} 说话，松开后发送。确认键是 {config.audio.confirm_key}。Ctrl+C 退出。",
+            f"正在听。按住 {config.audio.hotkey} 说话，松开后发送。"
+            f"等得久可以说「后台做」或「停」。确认键是 {config.audio.confirm_key}。Ctrl+C 退出。",
             flush=True,
         )
     else:
-        print("正在听（VAD）。说完停顿后会发送。Ctrl+C 退出。", flush=True)
+        print("正在听（VAD）。说完停顿后会发送。等得久可以说「后台做」或「停」。Ctrl+C 退出。", flush=True)
     try:
         while True:
             try:
@@ -242,12 +253,13 @@ def _listen_audio(runtime) -> int:
                 runtime.orchestrator.poll()
                 continue
             if event.kind == "confirm_key":
-                runtime.orchestrator.confirm_with_key()
+                runtime.orchestrator.confirm_with_key(wait=False)
             elif event.kind == "speech_end" and event.wav_path:
-                runtime.orchestrator.handle_wav(event.wav_path)
+                runtime.orchestrator.handle_wav(event.wav_path, wait=False)
             runtime.orchestrator.poll()
     except KeyboardInterrupt:
         print()
+        runtime.orchestrator.shutdown()
         return 0
     finally:
         audio.stop()

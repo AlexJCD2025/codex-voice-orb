@@ -13,6 +13,9 @@ def test_example_config_loads_safe_defaults():
     assert config.codex.bin == "/opt/homebrew/bin/codex"
     assert config.codex.sandbox == "read-only"
     assert config.codex.resume == "id"
+    assert config.codex.timeout_s == 600
+    assert config.presence.enabled is True
+    assert config.presence.progress_start_s == 30
     assert config.codex.skip_git_repo_check is True
     assert config.audio.mode == "ptt"
     assert config.audio.hotkey == "ctrl+alt+space"
@@ -71,6 +74,10 @@ def test_missing_file(tmp_path: Path):
 def test_builtin_defaults_do_not_enable_full_auto():
     config = AppConfig()
     assert config.codex.sandbox == "read-only"
+    assert config.codex.timeout_s == 600
+    assert config.presence.enabled is True
+    assert config.presence.filler_delay_s == 2
+    assert config.presence.progress_start_s == 30
     assert config.permissions.allow_full_auto is False
     assert config.codex.extra_args == ()
 

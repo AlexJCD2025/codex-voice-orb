@@ -2,7 +2,7 @@
 
 按住说话，把一句话交给你 Mac 上的 Codex CLI，再把回复里的短结论读出来。形态上接近 OPPO 的「心力球」：领夹麦负责收音，智能体在另一头做事。这里的智能体是本机的 `codex`，硬件是现成的无线领夹麦和 Mac 的扬声器或耳机。
 
-这不是实时闲聊音箱。Codex 要思考、读仓库、跑命令，一轮经常要几秒到几十秒。说完会先听到一声「好。」，完整回复打在终端里，语音只读一句摘要。
+这不是实时闲聊音箱。Codex 要思考、读仓库、跑命令，一轮经常要几十秒，只读规划有时要一分多钟。说完会先听到一声「好。」。超过大约两秒还没有结论，会再补一句「我看一下。」，之后偶尔说一句它在做什么。完整回复打在终端里，语音只读一句摘要。
 
 ## 一轮对话
 
@@ -12,8 +12,8 @@
 4. 规划轮里的只读查看（`pwd`、`rg`、`sed -n` 这类）不会要求确认。规划给出可以直接朗读的结论时，这一轮就结束，并读出摘要。
    只有规划自己列出了写文件、删除、付款、部署、发送，或要在比 `read-only` 更宽的沙箱里再开一轮时，才停下来等确认。确认之后才另起执行进程。
 5. 删除、付款、部署、发送，以及 `danger-full-access`，只能按确认键。说「确认」不算。其他动作可以说「确认」或按 `Ctrl+Shift+Y`。十秒内不确认就取消，过期的「确认」不会再开一轮。
-6. 下一轮用保存的 thread id 走 `codex exec resume <id>`。只在这一轮成功结束（`turn.completed`）后才保存。不会使用 `resume --last`。
-7. macOS `say` 合成摘要，`afplay` 播放。你再次开口或按下热键时，播放立刻停。
+6. 下一轮用保存的 thread id 走 `codex exec resume <id>`。Codex 一报 `thread.started` 就记下，所以这一轮被停掉或超时之后，说「继续」或「接着上次聊」还能接上。不会使用 `resume --last`。
+7. macOS `say` 合成摘要，`afplay` 播放。你再次开口或按下热键时，播放立刻停。正在跑的 Codex 不会因此被杀掉；说「停」或「取消」才会停掉它。
 
 默认执行沙箱是 `read-only`。需要改仓库里的文件时，把配置改成 `workspace-write`。规划轮仍然是 `read-only`。`--yolo`、`--dangerously-bypass-approvals-and-sandbox` 一律拒绝。`--full-auto` 不是 Codex CLI 0.153.4 的参数，出现在参数里也会被拒绝。
 
@@ -88,7 +88,9 @@ cp config.example.yaml ~/.codex-voice-orb/config.yaml
 - `codex.model`：传给 `codex exec -m`
 - `codex.config_overrides`：只接受 `model`、`model_reasoning_effort`，以及 `sandbox_workspace_write.network_access=false`
 - `codex.images` 或命令行 `--image`：传给 `--image`。执行轮如果续上了规划的 thread id，就不再重复传图片
-- `codex.resume`：只能是 `id`。用上次成功保存的 thread id，不会调用 `resume --last`
+- `codex.timeout_s`：一轮最长秒数，默认 600（10 分钟）。只读规划常常超过一分钟，短超时会把还在看仓库的回合掐掉
+- `codex.resume`：只能是 `id`。用已经记下的 thread id，不会调用 `resume --last`
+- `presence.enabled`：设成 `false` 就关掉填充语、进度和卡住提醒。默认大约 2 秒说「我看一下。」，之后 30 秒、60 秒、120 秒各说一句近况
 - `tts.voice`：例如 `Ting-Ting`。不填就用系统默认声音
 
 没有 `extra_args`。命令行是闭合的，不能从配置里再塞 `--add-dir`、`--sandbox` 或 `--config`。`permissions.allow_full_auto: true` 会让配置加载失败。`allow_danger_full_access` 默认是 `false`；只有显式打开，并且用户按了确认键，执行轮才能使用 `danger-full-access`。规划轮仍然是只读。
@@ -112,7 +114,7 @@ cp config.example.yaml ~/.codex-voice-orb/config.yaml
    orb once --text "用两句话说明当前目录是做什么的"
    ```
 
-   终端会打出完整回复，扬声器或耳机会读一句摘要，退出码为 0。规划时 Codex 可以跑 `pwd`、`rg`、`sed -n` 这类只读命令，不该因此停下来等确认。如果它要求确认后才肯回答「这个目录是做什么的」，那是闸门把查看当成了执行。失败时先看 `codex login status`，以及 doctor 打印的 `codex.bin` 绝对路径。
+   终端会打出完整回复，扬声器或耳机会读一句摘要，退出码为 0。这一轮如果超过两秒，会先听到「我看一下。」，隔半分钟左右再听到它在看文件或在跑命令。规划时 Codex 可以跑 `pwd`、`rg`、`sed -n` 这类只读命令，不该因此停下来等确认。如果它要求确认后才肯回答「这个目录是做什么的」，那是闸门把查看当成了执行。失败时先看 `codex login status`，以及 doctor 打印的 `codex.bin` 绝对路径。
 
 3. 测多轮是不是同一条 Codex 会话：
 
@@ -133,7 +135,7 @@ cp config.example.yaml ~/.codex-voice-orb/config.yaml
    orb listen
    ```
 
-5. 测打断。等它开始朗读时，再按住热键说话。正在播的声音应马上停，新的一句进入下一轮。
+5. 测打断和后台。问一个要看仓库的问题，听到「我看一下。」之后说「后台做」或「先这样」。它应继续做，不立刻读结论；你安静下来之后再听到结果。改口说「停」或「取消」，这一轮应停掉，不再读结论。说「继续」或「接着上次聊」，会接上刚才记下的 thread id。等它开始朗读时再按住热键，正在播的声音应马上停。
 
 6. 测高风险确认。说「把临时文件删掉」，或：
 
@@ -182,7 +184,9 @@ cp config.example.yaml ~/.codex-voice-orb/config.yaml
 - 音频、whisper.cpp 的文本和 `say` 的 AIFF 用 `0600`，目录用 `0700`，用完就删。删不掉会打出警告。
 - 指标日志只记耗时和字符数，不记原文。
 - 发给 Codex 的是文字。语音不会被拼进 shell。
-- 打断会先 SIGTERM 进程组，宽限之后 SIGKILL，并关掉管道，避免读 stdout 的线程一直挂着。已经执行完的命令不会自动撤销。
+- 说「停」或「取消」会先 SIGTERM 进程组，宽限之后 SIGKILL，并关掉管道。已经执行完的命令不会自动撤销。说「后台做」或「先这样」不会杀进程。做完后等你不在说话、也没有在等确认时再开口。要是那一轮还得写、删、付款、部署或发送，它只把确认说出来，不会自己开执行进程。
+- 很久没有任何新事件，会说可能卡住了。命令或工具还在跑的时候不这么说。
+- 填充语和进度的节奏，以及「做完了再在安静时说」，思路来自 [xiaozhi-hub-server](https://github.com/justhalfbit/xiaozhi-hub-server)（MIT）的长任务和待汇报。这里没有照搬它的代码。
 - 确认有期限和轮次。超时之后的「确认」不会新开一轮。含糊的「好」「嗯」「可以」不算确认。等待确认时麦克风是关上的，避免把提示音又听成同意。
 
 ## 开发
@@ -206,9 +210,11 @@ orb/audio.py            采集、按住说话、RMS VAD
 orb/stt.py              faster-whisper / whisper.cpp
 orb/tts.py              say，可替换
 orb/playback.py         播放与打断
-orb/orchestrator.py     一轮的状态、确认、打断
+orb/orchestrator.py     一轮的状态、确认、后台和打断
+orb/presence.py         填充语、进度、卡住
+orb/voice_commands.py   停、后台做、继续
 orb/permissions.py      高风险粗筛和确认词
-orb/session.py          thread id
+orb/session.py          thread id。thread.started 时就写盘
 orb/backends/codex_cli.py
 orb/config.py  orb/cli.py  orb/metrics.py  orb/doctor.py
 ```

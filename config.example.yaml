@@ -45,8 +45,8 @@ codex:
   config_overrides: []      # 只允许 model、model_reasoning_effort，以及 sandbox_workspace_write.network_access=false
   images: []
   # cwd: ~/src/your-repo
-  timeout_s: 180
-  resume: id                # 只用已保存的 thread id。不会传 resume --last
+  timeout_s: 600            # 一轮最长 10 分钟。只读规划经常要一两分钟
+  resume: id                # 只用已保存的 thread id。一报 thread.started 就记下。不会传 resume --last
   skip_git_repo_check: true
   voice_preamble: "你正在通过语音助手回答。请先用一两句口语给出可以直接朗读的结论，不要使用 Markdown、代码块或链接。需要时再补充短细节。"
 
@@ -63,6 +63,15 @@ permissions:
 session:
   path: ~/.codex-voice-orb/session.json
   bind_cwd: true
+
+presence:
+  enabled: true             # false 就不再说填充语、进度和卡住提醒
+  filler_delay_s: 2         # 说完后这么久还没有结论，先说一句
+  filler: "我看一下。"
+  progress_start_s: 30      # 之后隔 30 秒、60 秒，再拉长到 progress_max_s
+  progress_max_s: 120
+  stuck_after_s: 90         # 这么久没有新事件，并且没有命令还在跑
+  stuck: "一会儿没有新消息，可能卡住了。"
 
 metrics:
   path: ~/.codex-voice-orb/metrics.jsonl

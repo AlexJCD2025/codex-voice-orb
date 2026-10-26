@@ -256,28 +256,55 @@ def test_danger_sandbox_stays_off_the_plan_turn(tmp_path):
     assert calls[1]["argv"][calls[1]["argv"].index("-s") + 1] == "danger-full-access"
 
 
-def test_thread_is_not_saved_without_successful_completion(tmp_path):
+def test_thread_is_saved_when_it_starts_and_kept_if_it_never_starts(tmp_path):
     store = SessionStore(tmp_path / "session.json")
+    notes = []
 
     def fail_runner(argv, stdin, on_line, cancel, timeout):
-        on_line(json.dumps({"type": "thread.started", "thread_id": "t"}) + "\n")
+        on_line(json.dumps({"type": "thread.started", "thread_id": "t-started"}) + "\n")
+        on_line(
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {"id": "c1", "type": "command_execution", "command": "rg README", "status": "in_progress"},
+                }
+            )
+            + "\n"
+        )
         on_line(json.dumps({"type": "turn.failed", "error": {"message": "boom"}}) + "\n")
         return 0, ""
 
     backend = CodexCliBackend(_config(tmp_path), runner=fail_runner, session=store)
     with pytest.raises(CodexExecError, match="boom"):
-        backend.plan("hi")
-    assert store.load() is None
+        backend.plan("hi", on_activity=lambda label, tools: notes.append((label, tools)))
+    assert store.load().thread_id == "t-started"
+    assert ("在看文件", 1) in notes
 
     def exit_runner(argv, stdin, on_line, cancel, timeout):
-        on_line(json.dumps({"type": "thread.started", "thread_id": "t2"}) + "\n")
+        on_line(json.dumps({"type": "thread.started", "thread_id": "t-exit"}) + "\n")
         on_line(json.dumps(_message("半截")) + "\n")
         return 2, "not logged in"
 
     backend = CodexCliBackend(_config(tmp_path), runner=exit_runner, session=store)
     with pytest.raises(CodexExecError, match="not logged in"):
         backend.plan("hi")
-    assert store.load() is None
+    assert store.load().thread_id == "t-exit"
+
+    def no_thread_runner(argv, stdin, on_line, cancel, timeout):
+        on_line(json.dumps({"type": "error", "message": "not logged in"}) + "\n")
+        return 1, "not logged in"
+
+    store.save("keep-me", os.getcwd())
+    backend = CodexCliBackend(_config(tmp_path), runner=no_thread_runner, session=store)
+    with pytest.raises(CodexExecError):
+        backend.plan("hi")
+    assert store.load().thread_id == "keep-me"
+    calls = []
+    lines = _events({"type": "thread.started", "thread_id": "keep-me"}, _message("接着。"), _completed())
+    backend = CodexCliBackend(_config(tmp_path), runner=_runner(lines, calls), session=store)
+    backend.plan("继续说")
+    assert calls[0]["argv"][calls[0]["argv"].index("resume") + 1] == "keep-me"
+    assert "--last" not in calls[0]["argv"]
 
 
 def test_cwd_change_starts_a_new_thread(tmp_path):

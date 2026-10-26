@@ -21,6 +21,7 @@ from orb.backends.base import (
 from orb.codex_safety import UnsafeCodexInvocation, assert_argv_safe
 from orb.config import AppConfig
 from orb.plan import PlannedAction, PlanResult, parse_plan, write_plan_schema
+from orb.presence import activity_label
 from orb.procutil import terminate_group
 from orb.session import SessionStore
 
@@ -211,6 +212,7 @@ class CodexCliBackend:
         *,
         images: Sequence[str] = (),
         cancel: CancelToken | None = None,
+        on_activity: Callable[[str, int], None] | None = None,
     ) -> PlanResult:
         """Read-only planning turn. JSONL events are recorded, not treated as a gate."""
         if cancel is not None and cancel.is_set():
@@ -227,6 +229,7 @@ class CodexCliBackend:
             confirmed=False,
         )
         holder = self._holder()
+        holder["on_activity"] = on_activity
         log.info("codex plan sandbox=read-only resume=%s", resume_id or "new")
         log.debug("codex argv=%s", argv)
         rendered = self.render_plan_prompt(prompt)
@@ -251,6 +254,7 @@ class CodexCliBackend:
         images: Sequence[str] = (),
         resume_id: str | None = None,
         cancel: CancelToken | None = None,
+        on_activity: Callable[[str, int], None] | None = None,
     ) -> BackendResult:
         """Second process. Call this only after the user confirmed the listed actions."""
         if cancel is not None and cancel.is_set():
@@ -268,6 +272,7 @@ class CodexCliBackend:
             confirmed=True,
         )
         holder = self._holder()
+        holder["on_activity"] = on_activity
         log.info("codex execute sandbox=%s resume=%s", self.config.codex.sandbox, resume_id or "new")
         rendered = self.render_execute_prompt(prompt, actions)
         return_code, stderr = self._invoke(argv, rendered, holder, cancel)
@@ -405,8 +410,21 @@ class CodexCliBackend:
             "commands": [],
             "side_effects": [],
             "seen": set(),
+            "active_tools": {},
+            "on_activity": None,
             "completed": False,
         }
+
+    def saved_thread_id(self) -> str | None:
+        """Thread id already on disk. Used by「继续」. Never reads --last."""
+        self._reject_resume_last()
+        return self._resume_id()
+
+    def _remember_thread(self, thread_id: str) -> None:
+        """Save as soon as Codex reports thread.started, even if this turn is later killed."""
+        if self.session is None or not thread_id:
+            return
+        self.session.save(thread_id, self._cwd())
 
     def _save_if_completed(self, holder: dict[str, Any], return_code: int) -> None:
         if return_code != 0 or holder["errors"] or not holder["completed"]:
@@ -439,13 +457,22 @@ class CodexCliBackend:
             thread_id = event.get("thread_id")
             if isinstance(thread_id, str) and thread_id:
                 holder["thread_id"] = thread_id
+                # Interrupted and timed-out turns must still be resumable.
+                # An auth failure before this event must not overwrite a good id.
+                self._remember_thread(thread_id)
+            self._poke(holder, "")
+            return
+        if kind == "turn.started":
+            self._poke(holder, "")
             return
         if kind == "turn.completed":
             holder["completed"] = True
+            self._poke(holder, "")
             return
         if kind == "error":
             message = event.get("message") or event.get("error") or "codex error"
             holder["errors"].append(str(message))
+            self._poke(holder, "")
             return
         if kind == "turn.failed":
             error = event.get("error")
@@ -453,6 +480,7 @@ class CodexCliBackend:
                 holder["errors"].append(str(error.get("message") or error))
             else:
                 holder["errors"].append(str(error or "turn failed"))
+            self._poke(holder, "")
             return
         if kind not in {"item.started", "item.updated", "item.completed"}:
             return
@@ -460,15 +488,23 @@ class CodexCliBackend:
         if not isinstance(item, dict):
             return
         item_type = _item_type(item)
-        if item_type in {"agent_message", "assistant_message"} and kind == "item.completed":
-            text = _item_text(item).strip()
-            if text:
-                holder["messages"].append(text)
+        self._track_tool(holder, kind, item, item_type)
+        if item_type in {"agent_message", "assistant_message"}:
+            self._poke(holder, activity_label(item_type))
+            if kind == "item.completed":
+                text = _item_text(item).strip()
+                if text:
+                    holder["messages"].append(text)
+            return
+        if item_type in {"reasoning", "agent_reasoning"}:
+            self._poke(holder, activity_label(item_type))
             return
         # These events arrive after the tool has started. Read-only shells are
         # inspection, not a confirmation. Recording them does not undo them.
+        # A still-running command stays in active_tools so silence is not "stuck".
         if item_type == "command_execution":
             command = _item_command(item)
+            self._poke(holder, activity_label(item_type, command))
             if not command:
                 return
             if not self._mark(holder, ("command", str(item.get("id") or command))):
@@ -477,6 +513,7 @@ class CodexCliBackend:
             holder["side_effects"].append(command)
             return
         if item_type == "file_change":
+            self._poke(holder, activity_label(item_type))
             if not self._mark(holder, ("file", str(item.get("id") or kind))):
                 return
             changes = item.get("changes") or []
@@ -493,9 +530,35 @@ class CodexCliBackend:
             server = str(item.get("server") or "")
             tool = str(item.get("tool") or "")
             label = f"{server} {tool}".strip() or "mcp"
+            self._poke(holder, activity_label(item_type))
             if not self._mark(holder, ("mcp", str(item.get("id") or label))):
                 return
             holder["side_effects"].append(label)
+            return
+        self._poke(holder, activity_label(item_type))
+
+    def _track_tool(self, holder: dict[str, Any], kind: str, item: dict[str, Any], item_type: str) -> None:
+        if item_type not in {"command_execution", "mcp_tool_call", "file_change"}:
+            return
+        item_id = str(item.get("id") or "")
+        if not item_id:
+            return
+        active: dict[str, str] = holder["active_tools"]
+        status = str(item.get("status") or "")
+        if kind == "item.completed" or status in {"completed", "failed", "error"}:
+            active.pop(item_id, None)
+            return
+        if kind == "item.started" or status in {"in_progress", "running"}:
+            active[item_id] = item_type
+
+    def _poke(self, holder: dict[str, Any], label: str) -> None:
+        callback = holder.get("on_activity")
+        if callback is None:
+            return
+        try:
+            callback(label, len(holder["active_tools"]))
+        except Exception:
+            log.debug("activity callback failed", exc_info=True)
 
     def _mark(self, holder: dict[str, Any], key: tuple[str, str]) -> bool:
         seen: set[tuple[str, str]] = holder["seen"]

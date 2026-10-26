@@ -78,13 +78,26 @@ class CodexConfig:
     images: tuple[str, ...] = ()
     cwd: str | None = None
     extra_args: tuple[str, ...] = ()
-    timeout_s: float = 180.0
+    timeout_s: float = 600.0
     resume: str = "id"
     voice_preamble: str = (
         "你正在通过语音助手回答。请先用一两句口语给出可以直接朗读的结论，"
         "不要使用 Markdown、代码块或链接。需要时再补充短细节。"
     )
     skip_git_repo_check: bool = True
+
+
+@dataclass(frozen=True)
+class PresenceConfig:
+    """Spoken filler and progress while a Codex turn is still running."""
+
+    enabled: bool = True
+    filler_delay_s: float = 2.0
+    filler: str = "我看一下。"
+    progress_start_s: float = 30.0
+    progress_max_s: float = 120.0
+    stuck_after_s: float = 90.0
+    stuck: str = "一会儿没有新消息，可能卡住了。"
 
 
 @dataclass(frozen=True)
@@ -127,6 +140,7 @@ class AppConfig:
     session: SessionConfig = field(default_factory=SessionConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
+    presence: PresenceConfig = field(default_factory=PresenceConfig)
     config_path: str | None = None
 
 
@@ -140,6 +154,7 @@ _TOP_KEYS = {
     "session",
     "metrics",
     "paths",
+    "presence",
 }
 
 
@@ -187,6 +202,7 @@ def _from_mapping(data: dict[str, Any]) -> AppConfig:
     session = _session(_section(data, "session"))
     metrics = _metrics(_section(data, "metrics"))
     paths = _paths(_section(data, "paths"))
+    presence = _presence(_section(data, "presence"))
     config = AppConfig(
         audio=audio,
         stt=stt,
@@ -197,6 +213,7 @@ def _from_mapping(data: dict[str, Any]) -> AppConfig:
         session=session,
         metrics=metrics,
         paths=paths,
+        presence=presence,
     )
     _validate(config)
     return config
@@ -413,7 +430,7 @@ def _codex(raw: dict[str, Any]) -> CodexConfig:
         images=_strings(raw, "images"),
         cwd=_expand(_opt_str(raw, "cwd")),
         extra_args=(),
-        timeout_s=_float(raw, "timeout_s", 180.0),
+        timeout_s=_float(raw, "timeout_s", 600.0),
         resume=_choice(resume, {"id"}, "codex.resume"),
         voice_preamble=_str(raw, "voice_preamble", CodexConfig.voice_preamble),
         skip_git_repo_check=_bool(raw, "skip_git_repo_check", True),
@@ -460,6 +477,32 @@ def _metrics(raw: dict[str, Any]) -> MetricsConfig:
     return MetricsConfig(path=str(Path(path).expanduser()))
 
 
+def _presence(raw: dict[str, Any]) -> PresenceConfig:
+    _unknown(
+        raw,
+        {
+            "enabled",
+            "filler_delay_s",
+            "filler",
+            "progress_start_s",
+            "progress_max_s",
+            "stuck_after_s",
+            "stuck",
+        },
+        "presence",
+    )
+    defaults = PresenceConfig()
+    return PresenceConfig(
+        enabled=_bool(raw, "enabled", True),
+        filler_delay_s=_float(raw, "filler_delay_s", defaults.filler_delay_s),
+        filler=_str(raw, "filler", defaults.filler),
+        progress_start_s=_float(raw, "progress_start_s", defaults.progress_start_s),
+        progress_max_s=_float(raw, "progress_max_s", defaults.progress_max_s),
+        stuck_after_s=_float(raw, "stuck_after_s", defaults.stuck_after_s),
+        stuck=_str(raw, "stuck", defaults.stuck),
+    )
+
+
 def _paths(raw: dict[str, Any]) -> PathsConfig:
     _unknown(raw, {"audio_dir", "delete_audio_after_stt"}, "paths")
     audio_dir = _str(raw, "audio_dir", "~/.codex-voice-orb/audio")
@@ -482,6 +525,15 @@ def _validate(config: AppConfig) -> None:
         raise ConfigError("audio.max_utterance_s must be positive")
     if config.codex.timeout_s <= 0:
         raise ConfigError("codex.timeout_s must be positive")
+    if config.presence.filler_delay_s < 0 or config.presence.progress_start_s < 0:
+        raise ConfigError("presence delays must be >= 0")
+    if config.presence.progress_max_s < 0 or config.presence.stuck_after_s < 0:
+        raise ConfigError("presence delays must be >= 0")
+    if (
+        config.presence.progress_start_s > 0
+        and config.presence.progress_max_s < config.presence.progress_start_s
+    ):
+        raise ConfigError("presence.progress_max_s must be >= progress_start_s")
     if config.permissions.confirm_timeout_s <= 0:
         raise ConfigError("permissions.confirm_timeout_s must be positive")
     if config.tts.max_chars <= 0 or config.tts.max_sentences <= 0:

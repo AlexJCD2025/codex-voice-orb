@@ -1,4 +1,8 @@
-"""Persist the Codex thread id used by `codex exec resume`."""
+"""Persist the Codex thread id used by `codex exec resume <id>`.
+
+The id is written when Codex emits thread.started, so a stopped or timed-out
+turn can still be resumed. `--last` is never stored or passed.
+"""
 
 from __future__ import annotations
 

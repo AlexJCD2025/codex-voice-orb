@@ -30,11 +30,15 @@ class FakeBackend:
         self.side_effects: tuple[str, ...] = ()
         self.forced_plan = None
         self.always = False
+        self.thread_id = "thread-1"
 
     def always_requires_confirmation(self):
         return self.always
 
-    def plan(self, prompt, *, images=(), cancel=None):
+    def saved_thread_id(self):
+        return self.thread_id
+
+    def plan(self, prompt, *, images=(), cancel=None, on_activity=None):
         self.calls.append({"phase": "plan", "prompt": prompt, "images": tuple(images), "confirmed": False})
         if self.clock is not None:
             self.clock.advance(1.5)
@@ -63,7 +67,7 @@ class FakeBackend:
             plan = ExecutionPlan(spoken=self.text, execute=False, actions=())
         return PlanResult(plan=plan, session_id="thread-1", side_effects=self.side_effects)
 
-    def execute(self, prompt, actions, *, images=(), resume_id=None, cancel=None):
+    def execute(self, prompt, actions, *, images=(), resume_id=None, cancel=None, on_activity=None):
         self.calls.append(
             {
                 "phase": "execute",
